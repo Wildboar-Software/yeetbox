@@ -1,0 +1,862 @@
+// STATUS UPDATE 2023-11-03:
+// I need to take some time to think about if it is actually worth implementing
+// this. For most use cases, just using a remote file system such as Ceph or NFS
+// should be sufficient, and even better. What this gives you above and beyond
+// that is:
+// 1. An API written in PB, meaning that making clients will be super easy.
+// 2. Compression, Encryption, Auditing, Quotas, Watching.
+// 3. Presigned-URLs
+// 4. Microstamping
+syntax = "proto3";
+
+package remotefs;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/empty.proto";
+
+// Copied from my own crypto.proto
+message AlgorithmIdentifier {
+    repeated uint32 algorithm = 1;
+    bytes parameters = 2;
+}
+
+message Hash {
+    AlgorithmIdentifier algorithm = 1;
+    bytes value = 2;
+    uint32 trailingBits = 3;
+}
+
+// TODO: Note in the documentation that error codes are present in some results
+// so that this protocol can be used outside of GRPC.
+
+// NOTE: There is no cd or pwd operation. Every operation takes the full file
+// path every time. If a cd or pwd like functionality is desired, the state
+// must be stored in the client. This helps to prevent a user from, say, trying
+// to delete baz when in /foo/bar, but bar getting deleted beforehand and the
+// user accidentally deleting /foo/baz instead.
+service FileSystemService {
+    rpc GetAvailableSaslMechanisms (google.protobuf.Empty) returns (GetAvailableSaslMechanismsResult);
+    rpc Authenticate (AuthenticateArg) returns (AuthenticateResult);
+
+    rpc WatchMany (WatchManyArg) returns (stream FileSystemEvent);
+    rpc MakeDirectory (MakeDirectoryArg) returns (MakeDirectoryResult);
+    rpc Upload (UploadArg) returns (UploadResult);
+    rpc Append (AppendArg) returns (AppendResult);
+    rpc Patch (PatchArg) returns (PatchResult);
+    rpc Download (DownloadArg) returns (DownloadResult);
+    rpc Delete (DeleteArg) returns (DeleteResult);
+    rpc List (ListArg) returns (ListResult);
+    rpc Move (MoveArg) returns (MoveResult);
+    rpc Copy (CopyArg) returns (CopyResult);
+    rpc ListIncompleteUploads (ListIncompleteUploadsArg) returns (ListIncompleteUploadsResult);
+    rpc GetPresignedDownload (GetPresignedDownloadArg) returns (GetPresignedDownloadResult);
+    rpc GetPresignedUpload (GetPresignedUploadArg) returns (GetPresignedUploadResult);
+    rpc WatchOnce (WatchOnceArg) returns (WatchOnceResult);
+    rpc GetAttributes (GetAttributesArg) returns (GetAttributesResult);
+    rpc SetAttributes (SetAttributesArg) returns (SetAttributesResult);
+    rpc DeleteMany (DeleteManyArg) returns (DeleteManyResult);
+    rpc GetServiceInfo (GetServiceInfoArg) returns (GetServiceInfoResult);
+    rpc GetAuditTrail (GetAuditTrailArg) returns (GetAuditTrailResult);
+    rpc StartTransaction (StartTransactionArg) returns (StartTransactionResult);
+    rpc CommitTransaction (CommitTransactionArg) returns (CommitTransactionResult);
+    rpc AbortTransaction (AbortTransactionArg) returns (AbortTransactionResult);
+    rpc CreateLink (CreateLinkArg) returns (CreateLinkResult);
+    rpc Unlink (UnlinkArg) returns (UnlinkResult);
+}
+
+message StatelessRequest {
+    oneof op {
+        MakeDirectoryArg mkdir = 1;
+        UploadArg upload = 2;
+        DownloadArg download = 3;
+        DeleteArg delete = 4;
+        ListArg list = 5;
+        MoveArg move = 6;
+        CopyArg copy = 7;
+        ListIncompleteUploadsArg listinc = 8;
+        GetPresignedDownloadArg psdown = 9;
+        GetPresignedUploadArg psup = 10;
+        WatchOnceArg watch = 11;
+        GetAttributesArg getattrs = 12;
+        SetAttributesArg setattrs = 13;
+        DeleteManyArg delmany = 14;
+        AppendArg append = 15;
+        PatchArg patch = 16;
+    }
+}
+
+message StatelessResponse {
+    oneof op {
+        MakeDirectoryResult mkdir = 1;
+        UploadResult upload = 2;
+        DownloadResult download = 3;
+        DeleteResult delete = 4;
+        ListResult list = 5;
+        MoveResult move = 6;
+        CopyResult copy = 7;
+        ListIncompleteUploadsResult listinc = 8;
+        GetPresignedDownloadResult psdown = 9;
+        GetPresignedUploadResult psup = 10;
+        WatchOnceResult watch = 11;
+        GetAttributesResult getattrs = 12;
+        SetAttributesResult setattrs = 13;
+        DeleteManyResult delmany = 14;
+        AppendResult append = 15;
+        PatchResult patch = 16;
+    }
+}
+
+// Stateless operations do not depend on a persistent "connection" between
+// operations, so they were extracted into this message type that can be used
+// as the root message for datagram-based transport, such as UDP.
+message StatelessFileSystemOperation {
+    oneof op {
+        StatelessRequest req = 1;
+        StatelessResponse resp = 2;
+    }
+}
+
+message FileVersion {
+    // Increments after a major change.
+    uint64 major = 1;
+
+    // Increments after a "minor change," where a file is only appended to.
+    uint64 minor = 2;
+}
+
+message FileId {
+    repeated bytes path = 1; // A file system path. Not guaranteed to be UTF-8. Separators removed.
+    FileVersion version = 2;
+}
+
+enum FileSystemErrorCode {
+    NO_SUCH_FILE_OR_DIR = 0;
+    NOT_PERMITTED = 1;
+    READ_OUT_OF_BOUNDS = 2;
+    TOO_LARGE = 3;
+    NOT_IMPLEMENTED = 4;
+    NO_SUCH_VERSION = 5;
+    INVALID_OPERAND_TYPE = 6; // Tried to perform an operation on an object that does not support it (e.g. list on a file)
+    INVALID_URL_SIG = 7;
+    VERSIONING_NOT_SUPPORTED = 8;
+}
+
+message FileSystemError {
+    FileSystemErrorCode code = 1;
+
+    // If true, the server lazily evaluated user permissions or other
+    // preconditions for the operation, such that the error may be technically
+    // inaccurate and the operation might succeed if performed another way.
+    //
+    // One use case for this field is to permit a server to lazily evaluate
+    // permission to bulk operations. Instead of checking permissions / presence
+    // on an unlimited number of files, the server can just check if the user
+    // has unlimited read and write access, and reject the operation if not. We
+    // don't want the user to be misled into thinking they do not really have
+    // sufficient permissions if they do. This flag tells them "you don't have
+    // permissions for bulk copy, but all of the substituent individual copies
+    // might succeed."
+    bool lazy = 2;
+}
+
+message BaseNameFilter {
+    bytes beginsWith = 5;
+    bytes endsWith = 6;
+    bytes contains = 7;
+}
+
+message SubtreeSpec {
+    repeated bytes base = 1;
+    uint32 minimum = 2;
+    uint32 maximum = 3;
+    BaseNameFilter nameFilter = 4;
+}
+
+message UnixPermissions {
+    bool u_r = 1;
+    bool u_w = 2;
+    bool u_x = 3;
+    bool g_r = 4;
+    bool g_w = 5;
+    bool g_x = 6;
+    bool o_r = 7;
+    bool o_w = 8;
+    bool o_x = 9;
+}
+
+message DeviceID {
+    uint32 major = 1;
+    uint32 minor = 2;
+}
+
+// This is not to imply that all of these types have to be supported.
+enum ObjectType {
+    FILE = 0;
+    FOLDER = 1;
+    SYMLINK = 2;
+    FIFO = 3;
+    SOCKET = 4;
+}
+
+message FSAttributes {
+    optional ObjectType type = 1;
+    optional uint32 uid = 2;
+    optional uint32 gid = 3;
+    optional UnixPermissions perms = 4;
+    google.protobuf.Timestamp createTime = 5; // Unix crtime
+    google.protobuf.Timestamp modifyTime = 6; // Unix mtime
+    google.protobuf.Timestamp accessTime = 7; // Unix atime
+    google.protobuf.Timestamp changeTime = 8; // Unix ctime
+    google.protobuf.Timestamp deleteTime = 9;
+    optional uint64 size = 10;
+    optional DeviceID dev = 11;
+    optional uint32 hardlinks = 12;
+    optional uint64 inode = 13;
+    optional uint32 blockSize = 14;
+    optional uint32 blockCount = 15;
+    optional FileId source = 16; // For symbolic links only
+    optional uint64 entries = 17; // For folders only
+    uint32 storageTierId = 18;
+}
+
+message Mechanism {
+    string name = 1;
+    bool anonymous = 2;
+    bool transfers_plaintext_passwords = 3;
+    bool subject_to_dictionary_attack = 4;
+    bool subject_to_non_dictionary_attack = 5;
+    bool provides_forward_secrecy = 6;
+    bool provides_mutual_authentication = 7;
+    bool do_not_advertise = 8;
+    // Fields provided in the UserInformation by this mechanism, including
+    // those of the the other_info. This is so relying apps can determine
+    // if an authentication mechanism will be suitable.
+    repeated string info_provided = 9;
+}
+
+message GetAvailableSaslMechanismsResult {
+    repeated Mechanism mechanisms = 1;
+}
+
+message AuthenticateArg {
+    string mechanism = 1;
+    bytes assertion = 2;
+}
+
+message AuthenticateResult {
+    optional bool decision = 1;
+    bool user_disabled = 2;
+    bool all_auth_disabled = 3;
+    // TODO: Permissions?
+}
+
+message MakeDirectoryArg {
+    FileId target = 1;
+    uint32 uid = 2;
+    uint32 gid = 3;
+    optional UnixPermissions perms = 4;
+}
+
+message MakeDirectoryResult {
+    optional FileSystemError err = 1;
+}
+
+// Muliple options are available.
+message Hashes {
+    bytes sha2_512 = 1;
+    bytes sha3_512 = 2;
+    bytes xxh64 = 3;
+}
+
+// Multipart uploads take two forms:
+// Upload with incomplete=true, then Append() until finish.
+// Upload with reserve=N, then patch the holes until finish.
+
+message UploadArg {
+    FileId target = 1;
+    uint32 uid = 2;
+    uint32 gid = 3;
+    optional UnixPermissions perms = 4;
+
+    bytes data = 5;
+
+    // If true, create a new version if the file already exists.
+    bool next = 6;
+
+    // If true, mark this file as version "0.1" instead of "1.0".
+    bool incomplete = 7;
+
+    // Mark this file as version "0.1" and reserve this many bytes, filled with
+    // nulls. Patching will be used to "fill the holes" until the file is
+    // marked "complete."
+    uint64 reserve = 8;
+
+    // An opaque identifier used to continue an upload.
+    bytes continuation = 9;
+}
+
+message UploadResult {
+    optional FileSystemError err = 1;
+
+    // An opaque identifier that can be used to resume an upload.
+    // So that the client can resume an upload after network failure, the
+    // identifier should be random enough that it cannot be guessed.
+    bytes continuation = 2;
+}
+
+message AppendArg {
+    FileId target = 1;
+    bytes data = 2;
+    bool finish = 3;
+}
+
+message AppendResult {
+    optional FileSystemError err = 1;
+}
+
+message PatchArg {
+    FileId target = 1;
+    bytes data = 2;
+    uint64 offset = 3;
+    uint64 length = 4;
+    bool finish = 5;
+}
+
+message PatchResult {
+    optional FileSystemError err = 1;
+}
+
+message DownloadArg {
+    FileId target = 1;
+    uint64 offset = 2;
+    uint64 length = 3;
+}
+
+message DownloadResult {
+    optional FileSystemError err = 1;
+    bytes data = 2;
+}
+
+// Deletes a directory, file, or incomplete upload
+message DeleteArg {
+    FileId target = 1;
+
+    // If true, user requests that the file is overwritten so that remnants of
+    // it cannot be recovered from the disk. The server is not obliged to honor
+    // this request, and may "soft delete" as normal.
+    bool shred = 2;
+}
+
+message DeleteResult {
+    optional FileSystemError err = 1;
+
+    // Whether the server "hard deleted" the file by overwriting it with random
+    // data first.
+    bool shredded = 2;
+}
+
+message ListArg {
+    FileId target = 1;
+    bool attrs = 2; // If true, user requests attributes.
+    uint32 limit = 3;
+    uint32 skip = 4;
+    bool folders = 5; // If true, return folders only
+    bool thumbnails = 6; // Requests thumbnails for images.
+}
+
+message LinkInfo {
+    FileId target = 1;
+    bool hard = 2;
+}
+
+enum ImageType {
+    JPEG = 0;
+    PNG = 1;
+    GIF = 2;
+    BMP = 3;
+    TIFF = 4;
+    WEBP = 5;
+    SVG = 6;
+}
+
+message ThumbnailInfo {
+    ImageType imageType = 1;
+    bytes data = 2;
+}
+
+message ListEntry {
+    bytes relativeName = 1;
+    optional FSAttributes attrs = 2;
+    LinkInfo link = 3;
+    optional ThumbnailInfo thumbnail = 4;
+}
+
+message ListResult {
+    optional FileSystemError err = 1;
+    repeated ListEntry entries = 2;
+}
+
+message MoveArg {
+    FileId target = 1;
+    repeated bytes destination = 2;
+    // If true and if a file already exists at the destination, make this the new version.
+    bool next = 3;
+}
+
+message MoveResult {
+    optional FileSystemError err = 1;
+    FileVersion version = 2;
+}
+
+message CopyArg {
+    FileId target = 1;
+    repeated bytes destination = 2;
+    // If true and if a file already exists at the destination, make this the new version.
+    bool next = 3;
+}
+
+message CopyResult {
+    optional FileSystemError err = 1;
+    FileVersion version = 2;
+}
+
+message ListIncompleteUploadsArg {
+    repeated bytes subtree = 1; // Only everything that falls under this namespace.
+    uint32 limit = 2;
+    uint32 skip = 3;
+}
+
+message ListIncompleteUploadsResult {
+    optional FileSystemError err = 1;
+    repeated ListEntry entries = 2;
+}
+
+message DistinguishedNameRestrictions {
+    string c = 1;
+    string st = 2;
+    string l = 3;
+    string o = 4;
+    string ou = 5;
+    string cn = 6;
+    string g = 7;
+    string sn = 8;
+    string i = 9;
+    string q = 10;
+    string street = 11;
+    string dnQualifier = 12;
+    string serialNumber = 13;
+}
+
+message TimeBand {
+    google.protobuf.Timestamp startTime = 1;
+    google.protobuf.Timestamp endTime = 2;
+}
+
+message PresignedUrlPermissions {
+    TimeBand timeband = 1;
+    bool log = 3;
+    bool microstamp = 4;
+    repeated string fromSubnets = 5; // Authorized IP addresses, supporting CIDR notation.
+    repeated string userAgents = 6; // User-Agent globs. At least one must match the User-Agent header.
+
+    // If present, require client cert auth. Fields within place restrictions
+    // on what RDNs must be present within the DN.
+    //
+    // NOTE: When evaluating a DN, the highest up attribute value should never
+    // be overwritten, so that inferior CAs cannot create a user like
+    // C=SE,O=Bjog,C=US to bypass the C=US restriction, for instance.
+    optional DistinguishedNameRestrictions dn = 7;
+}
+
+message GetPresignedDownloadArg {
+    FileId target = 1;
+    PresignedUrlPermissions perms = 2;
+}
+
+message GetPresignedDownloadResult {
+    optional FileSystemError err = 1;
+    string url = 2;
+}
+
+message GetPresignedUploadArg {
+    FileId target = 1;
+    PresignedUrlPermissions perms = 2;
+    uint64 sizeLimit = 3;
+}
+
+message GetPresignedUploadResult {
+    optional FileSystemError err = 1;
+    string url = 2;
+}
+
+message WatchOnceArg {
+    FileId target = 1;
+}
+
+message WatchOnceResult {
+    optional FileSystemError err = 1;
+    optional FileSystemEvent event = 2;
+}
+
+message GetAttributesArg {
+    FileId target = 1;
+}
+
+message GetAttributesResult {
+    optional FileSystemError err = 1;
+    FSAttributes attrs = 2;
+}
+
+message SetAttributesArg {
+    FileId target = 1;
+    FSAttributes attrs = 2;
+}
+
+message SetAttributesResult {
+    optional FileSystemError err = 1;
+    FSAttributes attrs = 2;
+}
+
+message DeleteManyArg {
+    SubtreeSpec subtree = 1;
+    bool shred = 2;
+}
+
+message DeleteManyResult {
+    optional FileSystemError err = 1;
+    bool shredded = 3; // Should only be true if _all_ deleted files were "shredded."
+}
+
+message FSEventTypeSelections {
+    bool upload = 1;
+    bool delete = 2;
+    bool mkdir = 3;
+    bool move = 4;
+    bool copy = 5;
+    bool setattrs = 6;
+    bool patch = 7;
+    bool append = 8;
+    bool finish = 9;
+}
+
+message WatchManyArg {
+    SubtreeSpec subtree = 1;
+    uint64 minsize = 2;
+    uint64 maxsize = 3;
+    FSEventTypeSelections selections = 4;
+}
+
+message FileSystemEvent {
+    FileId target = 1;
+    oneof event {
+        UploadResult upload = 2;
+        DeleteResult delete = 3;
+        MakeDirectoryResult mkdir = 4;
+        MoveResult move = 5;
+        CopyResult copy = 6;
+        SetAttributesArg attrs = 7;
+        PatchResult patch = 8;
+        AppendResult append = 9;
+        FileId finish = 10;
+    }
+}
+
+message QuotaInfo {
+    uint64 yourMaxBytes = 1;
+    uint64 yourUsageBytes = 2;
+}
+
+message StorageLimits {
+    uint64 globalmax = 1;
+    uint64 globalused = 2;
+}
+
+/*
+In this protocol, a storage tier specifies:
+1. Compression
+2. Encryption
+3. Replication
+4. Storage Media
+*/
+
+message StorageTier {
+    uint32 id = 1;
+    bool encrypted = 2;
+    bool compressed = 3;
+    uint32 replications = 4;
+    string encryptionAlgorithm = 5; // Prefer lowercased letters and no dashes. E.g. "aes256cbc"
+}
+
+message StorageDevice {
+    string id = 1;
+    fixed64 sizeInBytes = 2;
+    fixed64 usedInBytes = 3;
+    bool readonly = 4;
+    string mountpoint = 5;
+    repeated StorageDevicePartition partitions = 6;
+    uint32 storageTier = 7;
+}
+
+message StorageDevicePartition {
+    string id = 1;
+    fixed64 sizeInBytes = 2;
+    fixed64 usedInBytes = 3;
+    bool readonly = 4;
+    string fstype = 5;
+    string mountpoint = 6;
+    uint32 storageTier = 7;
+}
+
+message StorageInfo {
+    repeated StorageDevice devices = 1;
+    repeated StorageTier tiers = 2;
+    StorageLimits limits = 3;
+}
+
+message HostInfo {
+    string hostname = 1;
+    StorageInfo storage = 2;
+}
+
+message GetServiceInfoArg {
+
+}
+
+message GetServiceInfoResult {
+    HostInfo host = 1;
+    QuotaInfo quota = 2;
+}
+
+message UploadAuditInfo {
+    uint32 uid = 2;
+    uint32 gid = 3;
+    optional UnixPermissions perms = 4;
+    // If true, create a new version if the file already exists.
+    repeated Hash hashes = 5;
+    bool next = 6;
+    // If true, mark this file as version "0.1" instead of "1.0".
+    bool incomplete = 7;
+    // Mark this file as version "0.1" and reserve this many bytes, filled with
+    // nulls. Patching will be used to "fill the holes" until the file is
+    // marked "complete."
+    uint64 reserve = 8;
+}
+
+message AppendInfo {
+    repeated Hash hashes = 2;
+    bool finish = 3;
+}
+
+message PatchInfo {
+    repeated Hash hashes = 1;
+    uint64 offset = 2;
+    uint64 length = 3;
+    bool finish = 4;
+}
+
+message DownloadInfo {
+    uint64 offset = 2;
+    uint64 length = 3;
+    bytes microstamp = 4;
+}
+
+message DeleteInfo {
+    optional bool shredded = 2;
+}
+
+message ListInfo {
+    bool attrs = 2; // If true, user requests attributes.
+    uint32 limit = 3;
+    uint32 skip = 4;
+    bool folders = 5; // If true, return folders only
+}
+
+message MoveInfo {
+    repeated bytes destination = 2;
+    optional bool next = 3;
+}
+
+message CopyInfo {
+    repeated bytes destination = 2;
+    optional bool next = 3;
+}
+
+message ListIncompleteUploadsInfo {
+    repeated bytes subtree = 1; // Only everything that falls under this namespace.
+    uint32 limit = 2;
+    uint32 skip = 3;
+}
+
+message GetPresignedDownloadInfo {
+    PresignedUrlPermissions perms = 2;
+}
+
+message GetPresignedUploadInfo {
+    PresignedUrlPermissions perms = 2;
+    uint64 sizeLimit = 3;
+}
+
+message WatchOnceInfo {
+
+}
+
+message GetAttributesInfo {
+
+}
+
+message SetAttributesInfo {
+    FSAttributes attrs = 2;
+}
+
+message DeleteManyInfo {
+    SubtreeSpec subtree = 1;
+    optional bool shred = 2;
+}
+
+message GetAuditTrailInfo {
+    SubtreeSpec subtree = 1;
+    TimeBand timeband = 2;
+    uint32 limit = 3;
+    uint32 skip = 4;
+    bool folders = 5; // If true, return folders only
+    uint32 entriesReturned = 6;
+}
+
+message StartTransactionInfo {
+    string txid = 1;
+    google.protobuf.Timestamp validUntil = 2;
+}
+
+message CommitTransactionInfo {
+    string txid = 1;
+    optional uint64 bytesModified = 2;
+    optional uint32 filesModified = 3;
+}
+
+message AbortTransactionInfo {
+    string txid = 1;
+}
+
+message CreateLinkInfo {
+    FileId destination = 2;
+    bool hard = 3;
+}
+
+message UnlinkInfo {
+
+}
+
+message UploadFromUrlInfo {
+    string userAgent = 1;
+    optional uint64 bytesModified = 2;
+}
+
+message DownloadFromUrlInfo {
+    string userAgent = 1;
+}
+
+// message
+
+message AuditAction {
+    oneof acttype {
+        MakeDirectoryArg mkdir = 1;
+        UploadAuditInfo upload = 2;
+        AppendInfo append = 3;
+        PatchInfo patch = 4;
+        DownloadInfo download = 5;
+        DeleteInfo delete = 6;
+        ListInfo list = 7;
+        MoveInfo move = 8;
+        CopyInfo copy = 9;
+        ListIncompleteUploadsInfo listIncUploads = 10;
+        GetPresignedDownloadInfo getPresignedDownload = 11;
+        GetPresignedUploadInfo getPresignedUpload = 12;
+        WatchOnceInfo watchOnce = 13;
+        GetAttributesInfo getAttributes = 14;
+        SetAttributesInfo setAttributes = 15;
+        DeleteManyInfo deleteMany = 16;
+        GetAuditTrailInfo getAuditTrail = 17;
+        StartTransactionInfo starttx = 18;
+        CommitTransactionInfo committx = 19;
+        AbortTransactionInfo aborttx = 20;
+        CreateLinkInfo link = 21;
+        UnlinkInfo unlink = 22;
+        UploadFromUrlInfo uploadUrl = 23;
+        DownloadFromUrlInfo downloadUrl = 24;
+    }
+}
+
+message AuditTrailItem {
+    google.protobuf.Timestamp timestamp = 1;
+    FileId target = 2;
+    optional AuditAction action = 3;
+    string byUser = 4;
+    optional bool failed = 5;
+    string remotePeer = 6; // IP address, hostname, etc.
+}
+
+message AuditTrail {
+    repeated AuditTrailItem trailItems = 1;
+    uint64 totalEvents = 2;
+}
+
+message GetAuditTrailArg {
+    SubtreeSpec subtree = 1;
+    TimeBand timeband = 2;
+    uint32 limit = 3;
+    uint32 skip = 4;
+    bool folders = 5; // If true, return folders only
+}
+
+message GetAuditTrailResult {
+    AuditTrail trail = 1;
+}
+
+message StartTransactionArg {
+
+}
+
+message StartTransactionResult {
+    string txid = 1; // Empty if transactions are not supported or not granted.
+    google.protobuf.Timestamp validUntil = 2;
+}
+
+message CommitTransactionArg {
+    string txid = 1;
+}
+
+message CommitTransactionResult {
+    bool ok = 1;
+    optional uint64 bytesModified = 2;
+    optional uint32 filesModified = 3;
+}
+
+message AbortTransactionArg {
+    string txid = 1;
+}
+
+message AbortTransactionResult {
+    bool ok = 1;
+}
+
+message CreateLinkArg {
+    FileId source = 1;
+    FileId destination = 2;
+    bool hard = 3;
+}
+
+message CreateLinkResult {
+    optional FileSystemError err = 1;
+}
+
+message UnlinkArg {
+    FileId target = 1;
+}
+
+message UnlinkResult {
+    optional FileSystemError err = 1;
+}
+
+// This API will not support lifecycles (For now). There is not a scalable / good way for the
+// server to keep track of when potentially billions of object cross the lifecycle.
+// Plus, there is an available workaround: just have a separate program that updates
