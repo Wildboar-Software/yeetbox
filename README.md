@@ -37,6 +37,10 @@ the following features in mind:
 - Prometheus Metrics
 - A Web Interface
 
+On top of this, there will be an HTTP / REST API that will attempt to be
+compatible with the APIs of AWS, Google Cloud, and Azure for the most important
+core operations, such as download and upload.
+
 It may be understood like so: whereas a native file system is more like a
 storage primitive, Yeetbox is a storage _application_.
 
@@ -105,7 +109,7 @@ organized in a less exportable manner.
   - [ ] Authenticate
   - [ ] WatchMany
   - [x] MakeDirectory
-  - [ ] Upload
+  - [x] Upload
   - [ ] Append
   - [ ] Patch
   - [ ] Download
@@ -127,6 +131,23 @@ organized in a less exportable manner.
   - [ ] AbortTransaction
   - [ ] CreateLink
   - [ ] Unlink
+  - [ ] List Versions
+  - [ ] Checkout (Reassign `head` symbolic link to a different version)
+  - [ ] Prepend?
+  - [ ] Delete Version?
+  - [ ] Search
+    - [ ] JSON Query
+    - [ ] XML Path
+    - [ ] Fuzzy Search
+    - [ ] Rows and Columns Count
+    - [ ] Field Names
+- [ ] Consolidate Appends / Patches
+- [ ] Do not increment version if hash is the same
+- [ ] `latest` per major version
+- [ ] Events
+- [ ] Download Folder as a Zip (And signature)
+- [ ] Download Encrypted Archive
+- [ ] Merkle Tree?
 - [ ] Configuration
 - [ ] Different Logging Interfaces
   - [ ] Syslog
@@ -155,6 +176,11 @@ organized in a less exportable manner.
 - [ ] WebDAV
 - [ ] Prometheus Endpoint
 - [ ] SNMP
+- [ ] On-Demand Format Translation
+  - [ ] Get JSON as XML
+  - [ ] Get XML as JSON
+  - [ ] Get JSON as YAML
+  - [ ] Get JSON as TOML
 - [ ] CLI
   - [ ] `mkdir`
   - [ ] `link`
