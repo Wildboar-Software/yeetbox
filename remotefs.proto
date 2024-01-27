@@ -201,10 +201,10 @@ message UnixPermissions {
     bool o_x = 9;
 }
 
-message DeviceID {
-    uint32 major = 1;
-    uint32 minor = 2;
-}
+// message DeviceID {
+//     uint32 major = 1;
+//     uint32 minor = 2;
+// }
 
 // This is not to imply that all of these types have to be supported.
 enum ObjectType {
@@ -226,11 +226,11 @@ message FSAttributes {
     google.protobuf.Timestamp changeTime = 8; // Unix ctime
     google.protobuf.Timestamp deleteTime = 9;
     optional uint64 size = 10;
-    optional DeviceID dev = 11;
-    optional uint32 hardlinks = 12;
+    optional uint64 dev = 11;
+    optional uint64 hardlinks = 12;
     optional uint64 inode = 13;
-    optional uint32 blockSize = 14;
-    optional uint32 blockCount = 15;
+    optional uint64 blockSize = 14;
+    optional uint64 blockCount = 15;
     optional FileId source = 16; // For symbolic links only
     optional uint64 entries = 17; // For folders only
     uint32 storageTierId = 18;
@@ -376,8 +376,8 @@ message DeleteResult {
 }
 
 message ListArg {
-    FileId target = 1;
-    bool attrs = 2; // If true, user requests attributes.
+    RequestedFileId target = 1;
+    bool attrs = 2; // If true, user requests attridbutes.
     uint32 limit = 3;
     uint32 skip = 4;
     bool folders = 5; // If true, return folders only

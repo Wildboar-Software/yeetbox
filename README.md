@@ -114,7 +114,7 @@ organized in a less exportable manner.
   - [ ] Patch
   - [ ] Download
   - [ ] Delete
-  - [ ] List
+  - [x] List
   - [ ] Move
   - [ ] Copy
   - [ ] ListIncompleteUploads
@@ -177,6 +177,7 @@ organized in a less exportable manner.
 - [ ] WebDAV
 - [ ] Prometheus Endpoint
 - [ ] SNMP
+- [ ] IPFS Backups / Storage
 - [ ] On-Demand Format Translation
   - [ ] Get JSON as XML
   - [ ] Get XML as JSON

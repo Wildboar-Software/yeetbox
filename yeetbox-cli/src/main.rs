@@ -3,6 +3,7 @@ use remotefs::{
     MakeDirectoryArg,
     UploadArg,
     DownloadArg,
+    ListArg,
 };
 
 pub mod remotefs {
@@ -66,24 +67,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // tonic::client::Grpc::max_decoding_message_size(self, 8 * 1024 * 1024);
 
-    let request3 = tonic::Request::new(DownloadArg {
+    // let request3 = tonic::Request::new(DownloadArg {
+    //     target: Some(remotefs::RequestedFileId {
+    //         path: vec![
+    //             Vec::from("foo"),
+    //             Vec::from("bar.txt"),
+    //         ],
+    //         version: None,
+    //     }),
+    //     length: 5,
+    //     offset: 3,
+    //     ..Default::default()
+    // });
+
+    // let response = client.download(request3).await?;
+    // println!("RESPONSE={:?}", response);
+
+    // let t = std::str::from_utf8(response.get_ref().data.as_slice()).unwrap();
+    // println!("{}", t);
+
+    let request3 = tonic::Request::new(ListArg {
         target: Some(remotefs::RequestedFileId {
             path: vec![
                 Vec::from("foo"),
-                Vec::from("bar.txt"),
             ],
             version: None,
         }),
-        length: 5,
-        offset: 3,
+        attrs: true,
         ..Default::default()
     });
 
-    let response = client.download(request3).await?;
+    let response = client.list(request3).await?;
     println!("RESPONSE={:?}", response);
-
-    let t = std::str::from_utf8(response.get_ref().data.as_slice()).unwrap();
-    println!("{}", t);
 
     Ok(())
 }

@@ -1,18 +1,35 @@
 use crate::grpc::remotefs::{
-    AbortTransactionArg, AbortTransactionResult, AppendArg, AppendResult, AuthenticateArg, AuthenticateResult, CommitTransactionArg, CommitTransactionResult, CopyArg, CopyResult, CreateLinkArg, CreateLinkResult, DeleteArg, DeleteManyArg, DeleteManyResult, DeleteResult, DownloadArg, DownloadResult, FileSystemEvent, FileVersion, GetAttributesArg, GetAttributesResult, GetAuditTrailArg, GetAuditTrailResult, GetAvailableSaslMechanismsResult, GetPresignedDownloadArg, GetPresignedDownloadResult, GetPresignedUploadArg, GetPresignedUploadResult, GetServiceInfoArg, GetServiceInfoResult, ListArg, ListIncompleteUploadsArg, ListIncompleteUploadsResult, ListResult, MakeDirectoryArg, MakeDirectoryResult, MoveArg, MoveResult, PatchArg, PatchResult, SetAttributesArg, SetAttributesResult, StartTransactionArg, StartTransactionResult, UnlinkArg, UnlinkResult, UploadArg, UploadResult, WatchManyArg, WatchOnceArg, WatchOnceResult
+    AbortTransactionArg, AbortTransactionResult, AppendArg, AppendResult, AuthenticateArg,
+    AuthenticateResult, CommitTransactionArg, CommitTransactionResult, CopyArg, CopyResult,
+    CreateLinkArg, CreateLinkResult, DeleteArg, DeleteManyArg, DeleteManyResult, DeleteResult,
+    DownloadArg, DownloadResult, FileSystemEvent, FileVersion, GetAttributesArg,
+    GetAttributesResult, GetAuditTrailArg, GetAuditTrailResult, GetAvailableSaslMechanismsResult,
+    GetPresignedDownloadArg, GetPresignedDownloadResult, GetPresignedUploadArg,
+    GetPresignedUploadResult, GetServiceInfoArg, GetServiceInfoResult, ListArg,
+    ListIncompleteUploadsArg, ListIncompleteUploadsResult, ListResult, MakeDirectoryArg,
+    MakeDirectoryResult, MoveArg, MoveResult, PatchArg, PatchResult, SetAttributesArg,
+    SetAttributesResult, StartTransactionArg, StartTransactionResult, UnlinkArg, UnlinkResult,
+    UploadArg, UploadResult, WatchManyArg, WatchOnceArg, WatchOnceResult, ListEntry,
+    FsAttributes, UnixPermissions
 };
 use crate::storage::Storage;
 use std::cmp::min;
-use std::io::Seek;
+use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
-use tokio::fs::{create_dir, create_dir_all, read_link, rename, symlink, try_exists, File, OpenOptions, read};
-use tokio::io::{AsyncSeekExt, AsyncWriteExt, AsyncReadExt};
+use tokio::fs;
+use tokio::fs::{
+    create_dir, create_dir_all, read_dir, read_link, rename, symlink, try_exists, File, OpenOptions,
+};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use ulid::Ulid;
+use crate::utils::system_time_to_grpc_timestamp;
 
 const HEAD_FILE_NAME: &str = "_head";
 const BLOBS_DIR_NAME: &str = "_blobs";
 const LATEST_FILE_NAME: &str = "_latest";
 const VERSIONS_DIR_NAME: &str = "_vers";
+const THUMBNAIL_FILE_NAME: &str = "_thumb";
 const MAJOR_VERSION_1: &str = "000000000001";
 const MINOR_VERSION_0: &str = "000000000000";
 
@@ -22,7 +39,7 @@ const MINOR_VERSION_0: &str = "000000000000";
 /// limits that Tonic puts on message decoding sizes.
 const MAX_READ_SIZE: usize = 8 * 1024 * 1024;
 
-fn strs_to_path (strs: &[Vec<u8>]) -> PathBuf {
+fn strs_to_path(strs: &[Vec<u8>]) -> PathBuf {
     let mut path = PathBuf::new();
     for s in strs {
         // FIXME: Don't just trust this input.
@@ -37,20 +54,17 @@ pub struct FileStorage {
 }
 
 impl FileStorage {
-
-    pub fn new () -> Self {
-        FileStorage{
+    pub fn new() -> Self {
+        FileStorage {
             path: std::path::PathBuf::from("/tmp/yeetbox"),
         }
     }
-
 }
 
 type WatchManyStream = tonic::codec::Streaming<FileSystemEvent>;
 
 #[tonic::async_trait]
 impl Storage for FileStorage {
-
     async fn watch_many(
         &self,
         request: tonic::Request<WatchManyArg>,
@@ -74,7 +88,7 @@ impl Storage for FileStorage {
         //     return Err(tonic::Status::already_exists("target already exists"));
         // }
         create_dir_all(path).await?;
-        Ok(tonic::Response::new(MakeDirectoryResult{
+        Ok(tonic::Response::new(MakeDirectoryResult {
             ..Default::default()
         }))
     }
@@ -103,7 +117,7 @@ impl Storage for FileStorage {
         let file_id = req.target.unwrap();
         let relpath = file_id.path;
         let mut blob_path = self.path.join(strs_to_path(&relpath)); // FIXME: Uncomment after testing.
-        // let mut blob_path = strs_to_path(&relpath);
+                                                                    // let mut blob_path = strs_to_path(&relpath);
         blob_path.push(BLOBS_DIR_NAME);
         create_dir_all(&blob_path).await?;
 
@@ -114,7 +128,8 @@ impl Storage for FileStorage {
             Ulid::new()
         } else {
             // Otherwise, we use the continuation token as the blob name.
-            let a: [u8; 16] = req.continuation[..].try_into()
+            let a: [u8; 16] = req.continuation[..]
+                .try_into()
                 .map_err(|_| tonic::Status::invalid_argument("invalid continuation token"))?;
             Ulid::try_from(a)
                 .map_err(|_| tonic::Status::invalid_argument("invalid continuation token"))?
@@ -125,7 +140,8 @@ impl Storage for FileStorage {
         let mut f = OpenOptions::new()
             .append(true) // We have to seek to the end to append.
             .create(true)
-            .open(&blob_path).await?;
+            .open(&blob_path)
+            .await?;
         // TODO: https://doc.rust-lang.org/nightly/std/fs/struct.File.html#method.set_len
         // TODO: https://doc.rust-lang.org/nightly/std/fs/struct.File.html#method.sync_all
         f.write(&req.data).await?;
@@ -133,7 +149,7 @@ impl Storage for FileStorage {
 
         if req.incomplete {
             let ulid_bytes = ulid.to_bytes();
-            return Ok(tonic::Response::new(UploadResult{
+            return Ok(tonic::Response::new(UploadResult {
                 continuation: ulid_bytes.to_vec(),
                 ..Default::default()
             }));
@@ -152,7 +168,7 @@ impl Storage for FileStorage {
             rename(&blob_path, &serial_path).await?;
             symlink(&serial_path, &head_path).await?;
             // TODO: Check if there is a newer symlink to it.
-            return Ok(tonic::Response::new(UploadResult{
+            return Ok(tonic::Response::new(UploadResult {
                 ..Default::default()
             }));
         }
@@ -172,10 +188,10 @@ impl Storage for FileStorage {
                 rename(&blob_path, &serial_path).await?;
                 symlink(&serial_path, &head_path).await?;
                 // TODO: Check if there is a newer symlink to it.
-                return Ok(tonic::Response::new(UploadResult{
+                return Ok(tonic::Response::new(UploadResult {
                     ..Default::default()
                 }));
-            },
+            }
         };
         let mut latest_real_path_components = latest_real_path.components().rev();
         // TODO: Handle missing latest error
@@ -184,7 +200,8 @@ impl Storage for FileStorage {
         if latest_major_str.is_none() {
             return Err(tonic::Status::internal(".head symlink is invalid"));
         }
-        let mut latest_major = latest_major_str.unwrap()
+        let mut latest_major = latest_major_str
+            .unwrap()
             .as_os_str()
             .to_str()
             .ok_or_else(|| tonic::Status::internal("major file name invalid"))?
@@ -204,7 +221,7 @@ impl Storage for FileStorage {
                     if e.kind() != std::io::ErrorKind::AlreadyExists {
                         return Err(e.into());
                     }
-                },
+                }
             };
         }
         if inc_tries == 1000 {
@@ -214,7 +231,7 @@ impl Storage for FileStorage {
         rename(&blob_path, &serial_path).await?;
         symlink(&serial_path, &head_path).await?;
         // TODO: Check if there is a newer symlink to it.
-        return Ok(tonic::Response::new(UploadResult{
+        return Ok(tonic::Response::new(UploadResult {
             ..Default::default()
         }));
         // TODO: Use req.reserve to reserve space for the file.
@@ -269,11 +286,13 @@ impl Storage for FileStorage {
         let mut data = Vec::with_capacity(alloc_size);
         // We have to set the length to the capacity because the read function
         // uses the length to determine how many bytes to read, not the capacity.
-        unsafe { data.set_len(alloc_size); }
+        unsafe {
+            data.set_len(alloc_size);
+        }
         let bytes_read = f.read(&mut data).await?;
         // Then we truncate it to the actual number of bytes read.
         data.truncate(bytes_read);
-        Ok(tonic::Response::new(DownloadResult{
+        Ok(tonic::Response::new(DownloadResult {
             data,
             more: bytes_read == alloc_size,
             ..Default::default()
@@ -293,7 +312,91 @@ impl Storage for FileStorage {
         request: tonic::Request<ListArg>,
     ) -> std::result::Result<tonic::Response<ListResult>, tonic::Status> {
         // https://doc.rust-lang.org/nightly/std/fs/fn.read_dir.html
-        unimplemented!()
+        let req = request.into_inner();
+        if req.target.is_none() {
+            return Err(tonic::Status::invalid_argument("target is required"));
+        }
+        let file_id = req.target.unwrap();
+        let relpath = file_id.path;
+        let mut path = self.path.join(strs_to_path(&relpath));
+
+        // We check if the path is a file or a directory.
+        // In this storage driver, files will always have a .head file in the
+        // directory that represents them.
+        path.push(HEAD_FILE_NAME);
+        // TODO: This requires you to forbid the creation of files with the special names in them.
+        match fs::metadata(&path).await {
+            Ok(_) => return Err(tonic::Status::not_found("no such directory")),
+            Err(_) => {}
+        };
+        path.pop();
+        let mut entries: Vec<ListEntry> = Vec::new();
+        let mut dir_ents = read_dir(path).await?;
+        while let Some(dir_ent) = dir_ents.next_entry().await? {
+            if [HEAD_FILE_NAME, BLOBS_DIR_NAME, VERSIONS_DIR_NAME]
+                .contains(&dir_ent.file_name().to_str().unwrap())
+            {
+                continue;
+            }
+            if !req.attrs {
+                entries.push(ListEntry {
+                    relative_name: dir_ent.file_name().into_vec(),
+                    ..Default::default()
+                });
+                continue;
+            }
+            let metadata = dir_ent.metadata().await?;
+            let mode = metadata.mode();
+            // let ft = dir_ent.file_type().await?;
+            let attrs = FsAttributes{
+                // There is no efficient way to determine the file type, because
+                // you would have to issue a read request for each folder
+                // beneath to determine if the file is a file or folder.
+                r#type: None,
+                uid: Some(metadata.uid()),
+                gid: Some(metadata.gid()),
+                perms: Some(UnixPermissions{
+                    // https://www.redhat.com/sysadmin/suid-sgid-sticky-bit
+                    // TODO: setuid / setgid / sticky?
+                    u_r: mode & 0o400 > 0,
+                    u_w: mode & 0o200 > 0,
+                    u_x: mode & 0o100 > 0,
+                    g_r: mode & 0o040 > 0,
+                    g_w: mode & 0o020 > 0,
+                    g_x: mode & 0o010 > 0,
+                    o_r: mode & 0o004 > 0,
+                    o_w: mode & 0o002 > 0,
+                    o_x: mode & 0o001 > 0,
+                }),
+                create_time: metadata.created().ok().map(system_time_to_grpc_timestamp),
+                modify_time: metadata.modified().ok().map(system_time_to_grpc_timestamp),
+                access_time: metadata.accessed().ok().map(system_time_to_grpc_timestamp),
+                change_time: Some(prost_types::Timestamp{
+                    seconds: metadata.ctime(),
+                    nanos: 0,
+                }),
+                // metadata.ctime().ok().map(system_time_to_grpc_timestamp),
+                delete_time: None, // Not currently supported.
+                size: Some(metadata.len()),
+                dev: Some(metadata.dev()),
+                hardlinks: Some(metadata.nlink()),
+                inode: Some(metadata.ino()),
+                block_size: Some(metadata.blksize()),
+                block_count: Some(metadata.blocks()),
+                entries: None, // Not currently supported.
+                storage_tier_id: 0, // Not supported in this driver.
+                ..Default::default()
+            };
+            entries.push(ListEntry {
+                relative_name: dir_ent.file_name().into_vec(),
+                attrs: Some(attrs),
+                ..Default::default()
+            });
+        }
+        Ok(tonic::Response::new(ListResult {
+            entries,
+            ..Default::default()
+        }))
     }
 
     async fn r#move(
@@ -417,5 +520,4 @@ impl Storage for FileStorage {
     ) -> std::result::Result<tonic::Response<UnlinkResult>, tonic::Status> {
         unimplemented!()
     }
-
 }

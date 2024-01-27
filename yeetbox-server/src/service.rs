@@ -93,7 +93,8 @@ impl FileSystemService for FileSystemServiceProvider {
         &self,
         request: tonic::Request<ListArg>,
     ) -> std::result::Result<tonic::Response<ListResult>, tonic::Status> {
-        unimplemented!()
+        let store = self.storage.lock().await;
+        store.list(request).await
     }
 
     async fn r#move(
