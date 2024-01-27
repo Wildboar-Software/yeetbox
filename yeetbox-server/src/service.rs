@@ -78,7 +78,8 @@ impl FileSystemService for FileSystemServiceProvider {
         &self,
         request: tonic::Request<DownloadArg>,
     ) -> std::result::Result<tonic::Response<DownloadResult>, tonic::Status> {
-        unimplemented!()
+        let store = self.storage.lock().await;
+        store.download(request).await
     }
 
     async fn delete(

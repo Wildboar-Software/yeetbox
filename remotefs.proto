@@ -129,6 +129,23 @@ message FileId {
     FileVersion version = 2;
 }
 
+message RequestedFileVersion {
+    // Increments after a major change.
+    uint64 major = 1;
+
+    // Increments after a "minor change," where a file is only appended to.
+    // This field being absent means "the latest minor version."
+    optional uint64 minor = 2;
+}
+
+// This is used for requesting a file by path, but not necessarily specifying a version.
+message RequestedFileId {
+    repeated bytes path = 1; // A file system path. Not guaranteed to be UTF-8. Separators removed.
+
+    // This being missing means "head."
+    optional RequestedFileVersion version = 2;
+}
+
 enum FileSystemErrorCode {
     NO_SUCH_FILE_OR_DIR = 0;
     NOT_PERMITTED = 1;
@@ -327,14 +344,17 @@ message PatchResult {
 }
 
 message DownloadArg {
-    FileId target = 1;
+    RequestedFileId target = 1;
     uint64 offset = 2;
     uint64 length = 3;
+    // TODO: Request version that was read.
 }
 
 message DownloadResult {
     optional FileSystemError err = 1;
     bytes data = 2;
+    FileVersion version = 3;
+    bool more = 4; // Returned if there is more data after the offset + data.length.
 }
 
 // Deletes a directory, file, or incomplete upload

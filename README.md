@@ -71,7 +71,7 @@ and gets Yeetbox to the level of a proof-of-concept quicker.
 
 ### Database
 
-All files are stored with randomized names in a flat folder (not technically
+All files are stored with hashes as names in a flat folder (not technically
 true, but close), and a database relates user-supplied names and version numbers
 to the blobs as though they were the file names. This will support all of the
 features and probably be faster, but the trade-off is that the files are
@@ -141,6 +141,7 @@ organized in a less exportable manner.
     - [ ] Fuzzy Search
     - [ ] Rows and Columns Count
     - [ ] Field Names
+  - [ ] Truncate (https://doc.rust-lang.org/nightly/std/fs/struct.File.html#method.set_len)
 - [ ] Consolidate Appends / Patches
 - [ ] Do not increment version if hash is the same
 - [ ] `latest` per major version

@@ -2,11 +2,25 @@ use crate::grpc::remotefs::{
     AbortTransactionArg, AbortTransactionResult, AppendArg, AppendResult, AuthenticateArg, AuthenticateResult, CommitTransactionArg, CommitTransactionResult, CopyArg, CopyResult, CreateLinkArg, CreateLinkResult, DeleteArg, DeleteManyArg, DeleteManyResult, DeleteResult, DownloadArg, DownloadResult, FileSystemEvent, FileVersion, GetAttributesArg, GetAttributesResult, GetAuditTrailArg, GetAuditTrailResult, GetAvailableSaslMechanismsResult, GetPresignedDownloadArg, GetPresignedDownloadResult, GetPresignedUploadArg, GetPresignedUploadResult, GetServiceInfoArg, GetServiceInfoResult, ListArg, ListIncompleteUploadsArg, ListIncompleteUploadsResult, ListResult, MakeDirectoryArg, MakeDirectoryResult, MoveArg, MoveResult, PatchArg, PatchResult, SetAttributesArg, SetAttributesResult, StartTransactionArg, StartTransactionResult, UnlinkArg, UnlinkResult, UploadArg, UploadResult, WatchManyArg, WatchOnceArg, WatchOnceResult
 };
 use crate::storage::Storage;
+use std::cmp::min;
 use std::io::Seek;
 use std::path::PathBuf;
-use tokio::fs::{create_dir, create_dir_all, read_link, rename, symlink, try_exists, File, OpenOptions};
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::fs::{create_dir, create_dir_all, read_link, rename, symlink, try_exists, File, OpenOptions, read};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, AsyncReadExt};
 use ulid::Ulid;
+
+const HEAD_FILE_NAME: &str = "_head";
+const BLOBS_DIR_NAME: &str = "_blobs";
+const LATEST_FILE_NAME: &str = "_latest";
+const VERSIONS_DIR_NAME: &str = "_vers";
+const MAJOR_VERSION_1: &str = "000000000001";
+const MINOR_VERSION_0: &str = "000000000000";
+
+/// This is to prevent a malicious client from sending a huge length and
+/// filling up the server's memory.
+/// This used to be set to 8_000_000, but I had to reduce it to 1MB because of
+/// limits that Tonic puts on message decoding sizes.
+const MAX_READ_SIZE: usize = 8 * 1024 * 1024;
 
 fn strs_to_path (strs: &[Vec<u8>]) -> PathBuf {
     let mut path = PathBuf::new();
@@ -15,10 +29,6 @@ fn strs_to_path (strs: &[Vec<u8>]) -> PathBuf {
         path.push(std::str::from_utf8(&s).unwrap());
     }
     path
-}
-
-fn vers_to_file_name (vers: FileVersion) -> String {
-    format!("v{:08}.{:08}.blob", vers.major, vers.minor)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -92,9 +102,9 @@ impl Storage for FileStorage {
         }
         let file_id = req.target.unwrap();
         let relpath = file_id.path;
-        // let mut blob_path = self.path.join(strs_to_path(&relpath)); // FIXME: Uncomment after testing.
-        let mut blob_path = strs_to_path(&relpath);
-        blob_path.push("_blobs");
+        let mut blob_path = self.path.join(strs_to_path(&relpath)); // FIXME: Uncomment after testing.
+        // let mut blob_path = strs_to_path(&relpath);
+        blob_path.push(BLOBS_DIR_NAME);
         create_dir_all(&blob_path).await?;
 
         // Determine or generate the name of the blob file, which is a ULID + ".blob".
@@ -116,6 +126,8 @@ impl Storage for FileStorage {
             .append(true) // We have to seek to the end to append.
             .create(true)
             .open(&blob_path).await?;
+        // TODO: https://doc.rust-lang.org/nightly/std/fs/struct.File.html#method.set_len
+        // TODO: https://doc.rust-lang.org/nightly/std/fs/struct.File.html#method.sync_all
         f.write(&req.data).await?;
         drop(f);
 
@@ -127,18 +139,18 @@ impl Storage for FileStorage {
             }));
         }
 
-        let mut latest_path = blob_path.clone();
-        latest_path.pop();
-        latest_path.pop();
-        let mut serial_path = latest_path.clone(); // There doesn't seem to be a way to only clone from [0..-2]
-        latest_path.push("latest");
+        let mut head_path = blob_path.clone();
+        head_path.pop();
+        head_path.pop();
+        let mut serial_path = head_path.clone(); // There doesn't seem to be a way to only clone from [0..-2]
+        head_path.push(HEAD_FILE_NAME);
 
         if !req.next {
-            serial_path.push("000000000001");
+            serial_path.push(MAJOR_VERSION_1);
             create_dir_all(&serial_path).await?; // TODO: More efficient version.
-            serial_path.push("000000000000");
+            serial_path.push(MINOR_VERSION_0);
             rename(&blob_path, &serial_path).await?;
-            symlink(&serial_path, &latest_path).await?;
+            symlink(&serial_path, &head_path).await?;
             // TODO: Check if there is a newer symlink to it.
             return Ok(tonic::Response::new(UploadResult{
                 ..Default::default()
@@ -146,7 +158,7 @@ impl Storage for FileStorage {
         }
 
         // If no such symlink, just create the file.
-        let latest_real_path = match read_link(&latest_path).await {
+        let latest_real_path = match read_link(&head_path).await {
             Ok(rp) => rp,
             Err(e) => {
                 // If the symlink is not found, we assume that the file was
@@ -154,11 +166,11 @@ impl Storage for FileStorage {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     return Err(e.into());
                 }
-                serial_path.push("000000000001");
+                serial_path.push(MAJOR_VERSION_1);
                 create_dir_all(&serial_path).await?; // TODO: More efficient version.
-                serial_path.push("000000000000");
+                serial_path.push(MINOR_VERSION_0);
                 rename(&blob_path, &serial_path).await?;
-                symlink(&serial_path, &latest_path).await?;
+                symlink(&serial_path, &head_path).await?;
                 // TODO: Check if there is a newer symlink to it.
                 return Ok(tonic::Response::new(UploadResult{
                     ..Default::default()
@@ -170,7 +182,7 @@ impl Storage for FileStorage {
         let _ = latest_real_path_components.next();
         let latest_major_str = latest_real_path_components.next();
         if latest_major_str.is_none() {
-            return Err(tonic::Status::internal("latest symlink is invalid"));
+            return Err(tonic::Status::internal(".head symlink is invalid"));
         }
         let mut latest_major = latest_major_str.unwrap()
             .as_os_str()
@@ -180,7 +192,7 @@ impl Storage for FileStorage {
             .map_err(|_| tonic::Status::internal("major file name invalid"))?;
 
         let mut inc_tries = 1;
-        let mut serial_path = latest_path.clone();
+        let mut serial_path = head_path.clone();
         while inc_tries <= 1000 {
             inc_tries += 1;
             latest_major += 1;
@@ -200,7 +212,7 @@ impl Storage for FileStorage {
         }
         serial_path.push(format!("{:012}", 0));
         rename(&blob_path, &serial_path).await?;
-        symlink(&serial_path, &latest_path).await?;
+        symlink(&serial_path, &head_path).await?;
         // TODO: Check if there is a newer symlink to it.
         return Ok(tonic::Response::new(UploadResult{
             ..Default::default()
@@ -226,13 +238,53 @@ impl Storage for FileStorage {
         &self,
         request: tonic::Request<DownloadArg>,
     ) -> std::result::Result<tonic::Response<DownloadResult>, tonic::Status> {
-        unimplemented!()
+        // TODO: Use the sendfile system call on Linux and Mac to pipe the file directly to the socket. (TransmitFile on Windows)
+        let req = request.into_inner();
+        if req.target.is_none() {
+            return Err(tonic::Status::invalid_argument("target is required"));
+        }
+        let file_id = req.target.unwrap();
+        let relpath = file_id.path;
+        let mut path = self.path.join(strs_to_path(&relpath));
+        if let Some(version) = file_id.version {
+            path.push(VERSIONS_DIR_NAME);
+            path.push(format!("{:012}", version.major));
+            if let Some(minor_version) = version.minor {
+                path.push(format!("{:012}", minor_version));
+            } else {
+                path.push(LATEST_FILE_NAME);
+            }
+        } else {
+            path.push(HEAD_FILE_NAME);
+        }
+        let mut f = File::open(path).await?;
+        if req.offset > 0 {
+            f.seek(std::io::SeekFrom::Start(req.offset as u64)).await?;
+        }
+        let alloc_size: usize = if req.length > 0 {
+            min(req.length as usize, MAX_READ_SIZE)
+        } else {
+            MAX_READ_SIZE
+        };
+        let mut data = Vec::with_capacity(alloc_size);
+        // We have to set the length to the capacity because the read function
+        // uses the length to determine how many bytes to read, not the capacity.
+        unsafe { data.set_len(alloc_size); }
+        let bytes_read = f.read(&mut data).await?;
+        // Then we truncate it to the actual number of bytes read.
+        data.truncate(bytes_read);
+        Ok(tonic::Response::new(DownloadResult{
+            data,
+            more: bytes_read == alloc_size,
+            ..Default::default()
+        }))
     }
 
     async fn delete(
         &self,
         request: tonic::Request<DeleteArg>,
     ) -> std::result::Result<tonic::Response<DeleteResult>, tonic::Status> {
+        // remove_dir_all
         unimplemented!()
     }
 
@@ -240,6 +292,7 @@ impl Storage for FileStorage {
         &self,
         request: tonic::Request<ListArg>,
     ) -> std::result::Result<tonic::Response<ListResult>, tonic::Status> {
+        // https://doc.rust-lang.org/nightly/std/fs/fn.read_dir.html
         unimplemented!()
     }
 
@@ -247,6 +300,7 @@ impl Storage for FileStorage {
         &self,
         request: tonic::Request<MoveArg>,
     ) -> std::result::Result<tonic::Response<MoveResult>, tonic::Status> {
+        // https://docs.rs/tokio/latest/tokio/fs/fn.rename.html
         unimplemented!()
     }
 
@@ -254,6 +308,7 @@ impl Storage for FileStorage {
         &self,
         request: tonic::Request<CopyArg>,
     ) -> std::result::Result<tonic::Response<CopyResult>, tonic::Status> {
+        // https://docs.rs/tokio/latest/tokio/fs/fn.copy.html
         unimplemented!()
     }
 
@@ -289,6 +344,8 @@ impl Storage for FileStorage {
         &self,
         request: tonic::Request<GetAttributesArg>,
     ) -> std::result::Result<tonic::Response<GetAttributesResult>, tonic::Status> {
+        // https://doc.rust-lang.org/nightly/std/fs/struct.Metadata.html
+        // https://doc.rust-lang.org/nightly/std/fs/fn.symlink_metadata.html
         unimplemented!()
     }
 
@@ -296,6 +353,10 @@ impl Storage for FileStorage {
         &self,
         request: tonic::Request<SetAttributesArg>,
     ) -> std::result::Result<tonic::Response<SetAttributesResult>, tonic::Status> {
+        // https://doc.rust-lang.org/nightly/std/fs/fn.set_permissions.html
+        // https://doc.rust-lang.org/nightly/std/fs/struct.File.html#method.set_modified
+        // https://doc.rust-lang.org/nightly/std/fs/struct.File.html#method.set_times
+        // https://doc.rust-lang.org/nightly/std/fs/struct.File.html#method.set_permissions
         unimplemented!()
     }
 
