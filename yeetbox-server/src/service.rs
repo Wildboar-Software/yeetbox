@@ -64,7 +64,8 @@ impl FileSystemService for FileSystemServiceProvider {
         &self,
         request: tonic::Request<AppendArg>,
     ) -> std::result::Result<tonic::Response<AppendResult>, tonic::Status> {
-        unimplemented!()
+        let store = self.storage.lock().await;
+        store.append(request).await
     }
 
     async fn patch(

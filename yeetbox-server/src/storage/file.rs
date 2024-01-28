@@ -10,7 +10,7 @@ use crate::grpc::remotefs::{
     MakeDirectoryResult, MoveArg, MoveResult, PatchArg, PatchResult, SetAttributesArg,
     SetAttributesResult, StartTransactionArg, StartTransactionResult, UnlinkArg, UnlinkResult,
     UploadArg, UploadResult, WatchManyArg, WatchOnceArg, WatchOnceResult, ListEntry,
-    FsAttributes, UnixPermissions
+    FsAttributes, UnixPermissions, ObjectType
 };
 use crate::storage::Storage;
 use std::cmp::min;
@@ -19,7 +19,8 @@ use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use tokio::fs;
 use tokio::fs::{
-    create_dir, create_dir_all, read_dir, read_link, rename, symlink, try_exists, File, OpenOptions,
+    create_dir, create_dir_all, read_dir, read_link, rename, symlink, try_exists,
+    File, OpenOptions, remove_dir_all
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use ulid::Ulid;
@@ -116,8 +117,7 @@ impl Storage for FileStorage {
         }
         let file_id = req.target.unwrap();
         let relpath = file_id.path;
-        let mut blob_path = self.path.join(strs_to_path(&relpath)); // FIXME: Uncomment after testing.
-                                                                    // let mut blob_path = strs_to_path(&relpath);
+        let mut blob_path = self.path.join(strs_to_path(&relpath));
         blob_path.push(BLOBS_DIR_NAME);
         create_dir_all(&blob_path).await?;
 
@@ -241,7 +241,68 @@ impl Storage for FileStorage {
         &self,
         request: tonic::Request<AppendArg>,
     ) -> std::result::Result<tonic::Response<AppendResult>, tonic::Status> {
-        unimplemented!()
+        let req = request.into_inner();
+        if req.target.is_none() {
+            return Err(tonic::Status::invalid_argument("target is required"));
+        }
+        let file_id = req.target.unwrap();
+        if file_id.version.is_none() {
+            return Err(tonic::Status::invalid_argument("version is required"));
+        }
+        let version = file_id.version.unwrap();
+        let relpath = file_id.path;
+        let mut blob_path = self.path.join(strs_to_path(&relpath));
+        blob_path.push(BLOBS_DIR_NAME);
+
+        // Determine or generate the name of the blob file, which is a ULID + ".blob".
+        let ulid = if req.continuation.len() == 0 {
+            // If the client did not supply a continuation token, this is a new
+            // upload, so we create a new blob.
+            Ulid::new()
+        } else {
+            // Otherwise, we use the continuation token as the blob name.
+            let a: [u8; 16] = req.continuation[..]
+                .try_into()
+                .map_err(|_| tonic::Status::invalid_argument("invalid continuation token"))?;
+            Ulid::try_from(a)
+                .map_err(|_| tonic::Status::invalid_argument("invalid continuation token"))?
+        };
+
+        let blob_file_name = format!("{}.blob", ulid);
+        blob_path.push(blob_file_name);
+        let mut f = OpenOptions::new()
+            .append(true) // We have to seek to the end to append.
+            .create(true)
+            .open(&blob_path)
+            .await?;
+        // TODO: https://doc.rust-lang.org/nightly/std/fs/struct.File.html#method.sync_all
+        f.write(&req.data).await?;
+        drop(f);
+
+        if !req.finish {
+            let ulid_bytes = ulid.to_bytes();
+            return Ok(tonic::Response::new(AppendResult {
+                continuation: ulid_bytes.to_vec(),
+                ..Default::default()
+            }));
+        }
+
+        let mut serial_path = blob_path.clone();
+        serial_path.pop();
+        serial_path.pop();
+        let mut serial_path = serial_path.clone(); // There doesn't seem to be a way to only clone from [0..-2]
+        serial_path.push(HEAD_FILE_NAME);
+        serial_path.push(format!("{:012}", version.major));
+        serial_path.push(format!("{:012}", version.minor + 1));
+
+        // Create new version 0000000001/0000000001
+        if try_exists(&serial_path).await? {
+            return Err(tonic::Status::already_exists("version already exists"));
+        }
+        rename(&blob_path, &serial_path).await?;
+        return Ok(tonic::Response::new(AppendResult {
+            ..Default::default()
+        }));
     }
 
     async fn patch(
@@ -303,8 +364,19 @@ impl Storage for FileStorage {
         &self,
         request: tonic::Request<DeleteArg>,
     ) -> std::result::Result<tonic::Response<DeleteResult>, tonic::Status> {
-        // remove_dir_all
-        unimplemented!()
+        let req = request.into_inner();
+        if req.target.is_none() {
+            return Err(tonic::Status::invalid_argument("target is required"));
+        }
+        let file_id = req.target.unwrap();
+        let relpath = file_id.path;
+        let path = self.path.join(strs_to_path(&relpath));
+        // TODO: I don't know how this will handle symbolic links.
+        remove_dir_all(&path).await?;
+        Ok(tonic::Response::new(DeleteResult {
+            shredded: false, // TODO: Implement shredding.
+            ..Default::default()
+        }))
     }
 
     async fn list(
@@ -347,26 +419,28 @@ impl Storage for FileStorage {
             }
             let metadata = dir_ent.metadata().await?;
             let mode = metadata.mode();
-            // let ft = dir_ent.file_type().await?;
             let attrs = FsAttributes{
                 // There is no efficient way to determine the file type, because
                 // you would have to issue a read request for each folder
                 // beneath to determine if the file is a file or folder.
-                r#type: None,
+                // The only thing we can definitely determine is if it is a
+                // symbolic link.
+                r#type: if metadata.is_symlink() { Some(ObjectType::Symlink.into()) } else { None },
                 uid: Some(metadata.uid()),
                 gid: Some(metadata.gid()),
                 perms: Some(UnixPermissions{
-                    // https://www.redhat.com/sysadmin/suid-sgid-sticky-bit
-                    // TODO: setuid / setgid / sticky?
-                    u_r: mode & 0o400 > 0,
-                    u_w: mode & 0o200 > 0,
-                    u_x: mode & 0o100 > 0,
-                    g_r: mode & 0o040 > 0,
-                    g_w: mode & 0o020 > 0,
-                    g_x: mode & 0o010 > 0,
-                    o_r: mode & 0o004 > 0,
-                    o_w: mode & 0o002 > 0,
-                    o_x: mode & 0o001 > 0,
+                    u_r:    mode & 0o0400 > 0,
+                    u_w:    mode & 0o0200 > 0,
+                    u_x:    mode & 0o0100 > 0,
+                    g_r:    mode & 0o0040 > 0,
+                    g_w:    mode & 0o0020 > 0,
+                    g_x:    mode & 0o0010 > 0,
+                    o_r:    mode & 0o0004 > 0,
+                    o_w:    mode & 0o0002 > 0,
+                    o_x:    mode & 0o0001 > 0,
+                    sticky: mode & 0o1000 > 0,
+                    setgid: mode & 0o2000 > 0,
+                    setuid: mode & 0o4000 > 0,
                 }),
                 create_time: metadata.created().ok().map(system_time_to_grpc_timestamp),
                 modify_time: metadata.modified().ok().map(system_time_to_grpc_timestamp),
@@ -375,7 +449,6 @@ impl Storage for FileStorage {
                     seconds: metadata.ctime(),
                     nanos: 0,
                 }),
-                // metadata.ctime().ok().map(system_time_to_grpc_timestamp),
                 delete_time: None, // Not currently supported.
                 size: Some(metadata.len()),
                 dev: Some(metadata.dev()),

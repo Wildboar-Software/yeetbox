@@ -199,6 +199,9 @@ message UnixPermissions {
     bool o_r = 7;
     bool o_w = 8;
     bool o_x = 9;
+    bool setuid = 10;
+    bool setgid = 11;
+    bool sticky = 12;
 }
 
 // message DeviceID {
@@ -322,13 +325,16 @@ message UploadResult {
 }
 
 message AppendArg {
+    // This intentionally requires a specified version.
     FileId target = 1;
     bytes data = 2;
     bool finish = 3;
+    bytes continuation = 4;
 }
 
 message AppendResult {
     optional FileSystemError err = 1;
+    bytes continuation = 2;
 }
 
 message PatchArg {
