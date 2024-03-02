@@ -4,6 +4,7 @@ use remotefs::{
     UploadArg,
     DownloadArg,
     ListArg,
+    AppendArg,
 };
 
 pub mod remotefs {
@@ -15,36 +16,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = FileSystemServiceClient::connect("http://127.0.0.1:50051").await?
         .max_decoding_message_size(8 * 1024 * 1024);
 
-    // let request = tonic::Request::new(MakeDirectoryArg {
-    //     gid: 100,
-    //     uid: 100,
-    //     perms: None,
-    //     target: Some(remotefs::FileId{
-    //         path: vec![Vec::from("foo".as_bytes())],
-    //         version: None,
-    //     }),
-    // });
+    let request = tonic::Request::new(MakeDirectoryArg {
+        gid: 100,
+        uid: 100,
+        perms: None,
+        target: Some(remotefs::FileId{
+            path: vec![String::from("foo")],
+            version: None,
+        }),
+    });
 
-    // let response = client.make_directory(request).await?;
+    let response = client.make_directory(request).await?;
+    println!("RESPONSE={:?}", response);
 
-    // let request1 = tonic::Request::new(UploadArg {
-    //     gid: 100,
-    //     uid: 100,
-    //     perms: None,
-    //     target: Some(remotefs::FileId{
-    //         path: vec![
-    //             Vec::from("foo"),
-    //             Vec::from("bar.txt"),
-    //         ],
-    //         version: None,
-    //     }),
-    //     data: Vec::from("Hello, world!".as_bytes()),
-    //     incomplete: true,
-    //     next: true,
-    //     ..Default::default()
-    // });
-    // let response = client.upload(request1).await?;
-    // println!("RESPONSE={:?}", response);
+    let request1 = tonic::Request::new(UploadArg {
+        gid: 100,
+        uid: 100,
+        perms: None,
+        target: Some(remotefs::FileId{
+            path: vec![
+                String::from("foo"),
+                String::from("bar.txt"),
+            ],
+            version: None,
+        }),
+        data: Vec::from("Hello, world!".as_bytes()),
+        incomplete: false,
+        next: false,
+        ..Default::default()
+    });
+    let response = client.upload(request1).await?;
+    println!("RESPONSE={:?}", response);
 
     // let request2 = tonic::Request::new(UploadArg {
     //     gid: 100,
@@ -67,29 +69,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // tonic::client::Grpc::max_decoding_message_size(self, 8 * 1024 * 1024);
 
-    // let request3 = tonic::Request::new(DownloadArg {
-    //     target: Some(remotefs::RequestedFileId {
-    //         path: vec![
-    //             Vec::from("foo"),
-    //             Vec::from("bar.txt"),
-    //         ],
-    //         version: None,
-    //     }),
-    //     length: 5,
-    //     offset: 3,
-    //     ..Default::default()
-    // });
+    let request3 = tonic::Request::new(DownloadArg {
+        target: Some(remotefs::RequestedFileId {
+            path: vec![
+                String::from("foo"),
+                String::from("bar.txt"),
+            ],
+            version: None,
+        }),
+        length: 5,
+        offset: 3,
+        ..Default::default()
+    });
 
-    // let response = client.download(request3).await?;
-    // println!("RESPONSE={:?}", response);
+    let response = client.download(request3).await?;
+    println!("RESPONSE={:?}", response);
 
     // let t = std::str::from_utf8(response.get_ref().data.as_slice()).unwrap();
     // println!("{}", t);
 
-    let request3 = tonic::Request::new(ListArg {
+    let request4 = tonic::Request::new(ListArg {
         target: Some(remotefs::RequestedFileId {
             path: vec![
-                Vec::from("foo"),
+                String::from("foo"),
             ],
             version: None,
         }),
@@ -97,7 +99,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     });
 
-    let response = client.list(request3).await?;
+    let response = client.list(request4).await?;
+    println!("RESPONSE={:?}", response);
+
+    let request5 = tonic::Request::new(AppendArg {
+        target: Some(remotefs::RequestedFileId {
+            path: vec![
+                String::from("foo"),
+                String::from("bar.txt"),
+            ],
+            version: None,
+        }),
+        data: Vec::from(" I am going to bed."),
+        ..Default::default()
+    });
+
+    let response = client.append(request5).await?;
     println!("RESPONSE={:?}", response);
 
     Ok(())

@@ -110,9 +110,10 @@ organized in a less exportable manner.
   - [ ] WatchMany
   - [x] MakeDirectory
   - [x] Upload
-  - [ ] Append
+  - [x] Append
   - [ ] Patch
-  - [ ] Download
+  - [x] Download
+  - [ ] Pop
   - [ ] Delete
   - [x] List
   - [ ] Move
@@ -126,9 +127,9 @@ organized in a less exportable manner.
   - [ ] DeleteMany
   - [ ] GetServiceInfo
   - [ ] GetAuditTrail
-  - [ ] StartTransaction
-  - [ ] CommitTransaction
-  - [ ] AbortTransaction
+  - [x] ~~StartTransaction~~
+  - [x] ~~CommitTransaction~~
+  - [x] ~~AbortTransaction~~
   - [ ] CreateLink
   - [ ] Unlink
   - [ ] List Versions
@@ -145,7 +146,7 @@ organized in a less exportable manner.
 - [ ] Consolidate Appends / Patches
 - [ ] Do not increment version if hash is the same
 - [ ] `latest` per major version
-- [ ] Events
+- [ ] Events, probably via ZeroMQ
 - [ ] Download Folder as a Zip (And signature)
 - [ ] Download Encrypted Archive
 - [ ] Merkle Tree?

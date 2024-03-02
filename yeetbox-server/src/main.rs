@@ -5,6 +5,7 @@ mod grpc;
 mod logging;
 mod service;
 mod storage;
+mod time64;
 mod utils;
 mod web;
 use authn::Authenticator;
@@ -13,7 +14,7 @@ use config::Config;
 use grpc::remotefs::file_system_service_server::{FileSystemService, FileSystemServiceServer};
 
 use logging::get_default_log4rs_config;
-use storage::file::FileStorage;
+use storage::database::DatabaseStorage;
 use storage::Storage;
 use tonic::{transport::Server, Request, Response, Status};
 // use warp::Filter;
@@ -35,13 +36,14 @@ pub struct FileSystemServiceProvider {
     pub config: Arc<Config>,
 }
 
+#[cfg(not(target_os = "wasi"))]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log4rs::init_config(get_default_log4rs_config()).unwrap();
     let addr = "127.0.0.1:50051".parse()?;
     let authenticator = Arc::new(Mutex::new(authn::SimpleAuth::new()));
     let authorizer = Arc::new(Mutex::new(authz::simple::SimpleAuthz::new()));
-    let storage = Arc::new(Mutex::new(FileStorage::new()));
+    let storage = Arc::new(Mutex::new(DatabaseStorage::new()));
     let fs_provider = FileSystemServiceProvider {
         authn: authenticator,
         authz: authorizer,

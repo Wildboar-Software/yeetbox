@@ -125,7 +125,7 @@ message FileVersion {
 }
 
 message FileId {
-    repeated bytes path = 1; // A file system path. Not guaranteed to be UTF-8. Separators removed.
+    repeated string path = 1;
     FileVersion version = 2;
 }
 
@@ -140,7 +140,7 @@ message RequestedFileVersion {
 
 // This is used for requesting a file by path, but not necessarily specifying a version.
 message RequestedFileId {
-    repeated bytes path = 1; // A file system path. Not guaranteed to be UTF-8. Separators removed.
+    repeated string path = 1;
 
     // This being missing means "head."
     optional RequestedFileVersion version = 2;
@@ -324,17 +324,19 @@ message UploadResult {
     bytes continuation = 2;
 }
 
+// There is no concept of continuation / partial appends. This is so the
+// appended data can be appended directly to the underlying file without the
+// potential of conflicting with other appends happening at the same time.
+//
+// This operation creates a new version on a normal blob, but does not on an
+// append blob.
 message AppendArg {
-    // This intentionally requires a specified version.
-    FileId target = 1;
+    RequestedFileId target = 1;
     bytes data = 2;
-    bool finish = 3;
-    bytes continuation = 4;
 }
 
 message AppendResult {
     optional FileSystemError err = 1;
-    bytes continuation = 2;
 }
 
 message PatchArg {
@@ -411,10 +413,12 @@ message ThumbnailInfo {
 }
 
 message ListEntry {
-    bytes relativeName = 1;
+    string relativeName = 1;
     optional FSAttributes attrs = 2;
     LinkInfo link = 3;
     optional ThumbnailInfo thumbnail = 4;
+    // string textPreview = 5;
+    // uint64 latestVersion = 6;
 }
 
 message ListResult {
@@ -651,6 +655,7 @@ message GetServiceInfoArg {
 message GetServiceInfoResult {
     HostInfo host = 1;
     QuotaInfo quota = 2;
+    uint32 maxMessageSize = 3;
 }
 
 message UploadAuditInfo {
@@ -659,9 +664,12 @@ message UploadAuditInfo {
     optional UnixPermissions perms = 4;
     // If true, create a new version if the file already exists.
     repeated Hash hashes = 5;
+
+    // If true, create a new version if a version already exists.
     bool next = 6;
-    // If true, mark this file as version "0.1" instead of "1.0".
+    // If true, we are not done uploading. Subsequent requests will complete the blob.
     bool incomplete = 7;
+
     // Mark this file as version "0.1" and reserve this many bytes, filled with
     // nulls. Patching will be used to "fill the holes" until the file is
     // marked "complete."

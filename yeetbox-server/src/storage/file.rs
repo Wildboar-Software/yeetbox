@@ -295,7 +295,6 @@ impl Storage for FileStorage {
         serial_path.push(format!("{:012}", version.major));
         serial_path.push(format!("{:012}", version.minor + 1));
 
-        // Create new version 0000000001/0000000001
         if try_exists(&serial_path).await? {
             return Err(tonic::Status::already_exists("version already exists"));
         }
