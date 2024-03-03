@@ -367,7 +367,7 @@ message DownloadResult {
 
 // Deletes a directory, file, or incomplete upload
 message DeleteArg {
-    FileId target = 1;
+    RequestedFileId target = 1;
 
     // If true, user requests that the file is overwritten so that remnants of
     // it cannot be recovered from the disk. The server is not obliged to honor

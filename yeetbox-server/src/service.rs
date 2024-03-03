@@ -87,7 +87,8 @@ impl FileSystemService for FileSystemServiceProvider {
         &self,
         request: tonic::Request<DeleteArg>,
     ) -> std::result::Result<tonic::Response<DeleteResult>, tonic::Status> {
-        unimplemented!()
+        let store = self.storage.lock().await;
+        store.delete(request).await
     }
 
     async fn list(

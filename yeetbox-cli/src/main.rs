@@ -5,6 +5,7 @@ use remotefs::{
     DownloadArg,
     ListArg,
     AppendArg,
+    DeleteArg
 };
 
 pub mod remotefs {
@@ -115,6 +116,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let response = client.append(request5).await?;
+    println!("RESPONSE={:?}", response);
+
+    let request6 = tonic::Request::new(DeleteArg {
+        target: Some(remotefs::RequestedFileId {
+            path: vec![
+                String::from("foo"),
+                String::from("bar.txt"),
+            ],
+            version: None,
+        }),
+        ..Default::default()
+    });
+
+    let response = client.delete(request6).await?;
     println!("RESPONSE={:?}", response);
 
     Ok(())

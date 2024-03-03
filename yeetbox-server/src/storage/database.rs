@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use tokio::fs::{self, read};
 use tokio::fs::{
     create_dir, create_dir_all, read_dir, read_link, rename, symlink, try_exists,
-    File, OpenOptions, remove_dir_all, metadata
+    File, OpenOptions, remove_dir_all, metadata, remove_file
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use ulid::Ulid;
@@ -837,6 +837,83 @@ impl Storage for DatabaseStorage {
         &self,
         request: tonic::Request<DeleteArg>,
     ) -> std::result::Result<tonic::Response<DeleteResult>, tonic::Status> {
+        let req = request.into_inner();
+        if req.target.is_none() {
+            return Err(tonic::Status::invalid_argument("target is required"));
+        }
+        let target = req.target.as_ref().unwrap();
+        let mut fullpath = target.path.clone();
+        if fullpath.len() == 0 {
+            return Err(tonic::Status::invalid_argument("target may not be empty"));
+        }
+        let r = self.db.begin_read()
+            .map_err(|_| tonic::Status::internal("could not read from database"))?;
+        let fs = r.open_table(FS_TABLE)
+            .map_err(|_| tonic::Status::internal("could not read from fs table"))?;
+        let file_name = fullpath.pop().unwrap();
+        let dir_name = fullpath;
+        let parent_id = descend_path(&dir_name, &fs)?;
+        let file_key = make_key(parent_id, &file_name);
+
+        let w = self.db.begin_write()
+            .map_err(|_| tonic::Status::internal("could not write to database"))?;
+        let mut fs = w.open_table(FS_TABLE)
+            .map_err(|_| tonic::Status::internal("could not write to fs table"))?;
+        let maybe_file_rec = fs.remove(&file_key.as_slice())
+            .map_err(|_| tonic::Status::internal("could not read from fs table"))?;
+        if maybe_file_rec.is_none() {
+            return Err(tonic::Status::invalid_argument("no such file"));
+        }
+        let file_rec_guard = maybe_file_rec.unwrap();
+        let file_rec_bytes = file_rec_guard.value();
+        let file_rec = fs_record_from_bytes(&file_rec_bytes);
+        if target.version.as_ref().is_some_and(|v| v.major != file_rec.latest_version) {
+            return Err(tonic::Status::invalid_argument("not deleting the latest version"));
+        }
+        if file_rec.r#type != OBJ_TYPE_FILE {
+            // TODO: Check if the folder is empty. Recurse if requested.
+            drop(file_rec_guard);
+            drop(fs);
+            w.commit()
+                .map_err(|_| tonic::Status::internal("could not delete folder"))?;
+            // Only files have versions.
+            return Ok(tonic::Response::new(DeleteResult {
+                shredded: false, // TODO: Implement shredding.
+                ..Default::default()
+            }));
+        }
+        let mut v = w.open_table(VER_TABLE)
+            .map_err(|_| tonic::Status::internal("could not read from versions table"))?;
+        let mut latest_version = file_rec.latest_version;
+
+        // Pay close attention: this loop is constructed to not underflow the latest_version variable.
+        loop {
+            let version_key = VersionRecordKey {
+                file_id: file_rec.id,
+                version: latest_version,
+            };
+
+            let version_key = bytemuck::bytes_of(&version_key);
+            let deleted_v = v.remove(&version_key)
+                .map_err(|_| tonic::Status::internal("could not delete from version table"))?;
+            if let Some(deleted_v) = deleted_v {
+                let d = deleted_v.value();
+                if d.len() > mem::size_of::<VersionRecordValue>() {
+                    let blob_name = unsafe {
+                        std::str::from_utf8_unchecked(&d[mem::size_of::<VersionRecordValue>()..])
+                    };
+                    let mut blob_path = self.blobs_path.clone();
+                    blob_path.push(blob_name);
+                    remove_file(&blob_path).await?;
+                    // There does not seem to be a good async shredding library for Rust anywhere.
+                }
+            }
+            if latest_version == 0 {
+                break;
+            }
+            latest_version -= 1;
+        }
+
         Ok(tonic::Response::new(DeleteResult {
             shredded: false, // TODO: Implement shredding.
             ..Default::default()
