@@ -103,14 +103,16 @@ impl FileSystemService for FileSystemServiceProvider {
         &self,
         request: tonic::Request<MoveArg>,
     ) -> std::result::Result<tonic::Response<MoveResult>, tonic::Status> {
-        unimplemented!()
+        let store = self.storage.lock().await;
+        store.r#move(request).await
     }
 
     async fn copy(
         &self,
         request: tonic::Request<CopyArg>,
     ) -> std::result::Result<tonic::Response<CopyResult>, tonic::Status> {
-        unimplemented!()
+        let store = self.storage.lock().await;
+        store.copy(request).await
     }
 
     async fn list_incomplete_uploads(

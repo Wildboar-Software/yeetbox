@@ -79,6 +79,7 @@ organized in a less exportable manner.
 
 ## To Do
 
+- [ ] Instead of the versioned / unversioned dichotomy, what if you just convert to versioned upon write (if requested)?
 - [ ] Best Practices
   - [ ] Use [Field Masks](https://protobuf.dev/programming-guides/api/#include-field-read-mask)
   - [ ] [Explicit Deadlines](https://protobuf.dev/programming-guides/api/#every-rpc-deadline)
@@ -114,10 +115,10 @@ organized in a less exportable manner.
   - [ ] Patch
   - [x] Download
   - [ ] Pop
-  - [ ] Delete
+  - [x] Delete
   - [x] List
-  - [ ] Move
-  - [ ] Copy
+  - [x] Move
+  - [x] Copy
   - [ ] ListIncompleteUploads
   - [ ] GetPresignedDownload
   - [ ] GetPresignedUpload
@@ -217,8 +218,7 @@ The blob storage interface is going to have pretty much the same API as the FS
 API, but every method will also take the `session` parameter and return async
 IO result. The same is true for the metadata storage interface.
 
-I am currently blocked on learning about XACML to determine how to implement the
-access control.
+I don't get what the difference between a normal blob and an append blob.
 
 ## Development
 
@@ -246,3 +246,49 @@ cargo run --bin yeetbox-cli
 
 Currently, there is no configuration, so the CLI should be able to reach the
 hard-coded socket on which the server listens.
+
+## Pre-Signed URL Format
+
+- Version
+- Algorithm
+- Credential / Key Used
+- Start and End times
+- Permissions (Taken from Azure's Blob Storage SAS)
+  - `r` read (`GET`)
+  - `a` add (`PATCH`?)
+  - `c` create (`PUT`)
+  - `w` write (`PUT` / `POST`)
+  - `d` delete (`DELETE`)
+  - `y` permanent delete (shred) (`DELETE`)
+  - `l` list (`GET`)
+  - `m` move
+  - `x` execute
+  - `o` ownership
+  - `p` permissions
+  - `i` immutability
+- Source IP
+- Service Identifier (optional ULID)
+- mTLS options
+  - CA / AuthorityKeyIdentifier
+  - Subject Key Identifier
+  - Subject DN attributes?
+- Namespace (`under=/foo/bar` or `exactly=/foo/bar`)
+  - If absent, the path was incorporated into the signature, and the URL can
+    only be used for that single path.
+- VersionSpace (`vs=1` and `ve=3` for "versions 1 through 3, inclusively" or `v=latest`)
+- offset
+- length (this can be used to limit the size of uploads)
+- File Extensions (`exts=mp3,jpeg`)
+- Authorized metadata
+
+The scheme and hostname will not be incorporated into the signature, because
+this promotes network agility. The server can be renamed or moved without
+breaking all existing URLs. It also means that the server does not even have to
+know its own routeable hostname, or even have a hostname at all.
+
+### Resources
+
+- https://learn.microsoft.com/en-us/rest/api/storageservices/create-user-delegation-sas
+- https://cloud.google.com/storage/docs/access-control/signed-urls
+- https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-authenticating-requests.html
+- https://docs.aws.amazon.com/IAM/latest/UserGuide/create-signed-request.html

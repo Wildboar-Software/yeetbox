@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use tokio::fs::{self, read};
 use tokio::fs::{
     create_dir, create_dir_all, read_dir, read_link, rename, symlink, try_exists,
-    File, OpenOptions, remove_dir_all, metadata, remove_file
+    File, OpenOptions, remove_dir_all, metadata, remove_file, copy
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use ulid::Ulid;
@@ -33,6 +33,8 @@ use crate::time64::{Time64, TIME64_UNKNOWN_TIME};
 const FS_TABLE_NAME: &str = "fs_table";
 const SEQ_TABLE_NAME: &str = "seq";
 const VER_TABLE_NAME: &str = "ver";
+const STATS_TABLE_NAME: &str = "stats";
+const ATTRS_TABLE_NAME: &str = "attrs";
 
 // This is the table where file system objects are stored.
 const FS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new(FS_TABLE_NAME);
@@ -42,6 +44,12 @@ const SEQ_TABLE: TableDefinition<&str, u64> = TableDefinition::new(SEQ_TABLE_NAM
 
 // This is the table where file versions are stored.
 const VER_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new(VER_TABLE_NAME);
+
+// This is where user quotas, overall storage stats, etc. are stored.
+const STATS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new(STATS_TABLE_NAME);
+
+// This is where user quotas, overall storage stats, etc. are stored.
+const ATTRS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new(ATTRS_TABLE_NAME);
 
 const HEAD_FILE_NAME: &str = "_head";
 const BLOBS_DIR_NAME: &str = "_blobs";
@@ -94,13 +102,14 @@ pub struct FsRecordKey {
 
 // Used by the flags field.
 // TODO: Mask off only the LS nibble for file type. The MS nibble could be used for more flags.
-pub const OBJ_TYPE_FILE: u8 = 0;
-pub const OBJ_TYPE_FOLDER: u8 = 1;
-pub const OBJ_TYPE_SYMLINK: u8 = 2;
-pub const OBJ_TYPE_FIFO: u8 = 3;
-pub const OBJ_TYPE_SOCKET: u8 = 4;
-pub const OBJ_TYPE_APPEND_BLOB: u8 = 5; // append operation will not create a new version.
-pub const OBJ_TYPE_BLOCK_BLOB: u8 = 6;
+pub const OBJ_TYPE_NORMAL_BLOB: u8 = 0;
+pub const OBJ_TYPE_VERSION_BLOB: u8 = 1;
+pub const OBJ_TYPE_APPEND_BLOB: u8 = 2; // append operation will not create a new version.
+pub const OBJ_TYPE_BLOCK_BLOB: u8 = 3;
+pub const OBJ_TYPE_FOLDER: u8 = 4;
+pub const OBJ_TYPE_SYMLINK: u8 = 5;
+pub const OBJ_TYPE_FIFO: u8 = 6;
+pub const OBJ_TYPE_SOCKET: u8 = 7;
 pub const UNIX_PERM_U_R: u16 = 0o0400;
 pub const UNIX_PERM_U_W: u16 = 0o0200;
 pub const UNIX_PERM_U_X: u16 = 0o0100;
@@ -118,6 +127,12 @@ pub const UNKNOWN_SIZE: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 // TODO: empty flag
 
 // TODO: Optimization flag indicating empty file, or perhaps inlined file contents
+
+// TODO: Copy-on-write flag: indication that the underlying file was copied.
+/* I will have to think long and hard about the CoW flag. It could be a security
+or integrity vulnerability. The source file will have to be flagged too. What
+if the destination is copied once more? There might be a lot of dangers with
+this. */
 
 // FIXME: Actually, I think these fields should go in the versions.
 // Then again, they need to be in here for things not versioned, like folders.
@@ -146,9 +161,13 @@ pub struct FsRecordValue {
     pub other2: u16, // for future use + alignment.
     pub other3: u32, // for future use + alignment.
     pub latest_version: u64,
-    // Actually, variable length part will be the non-normalized file name.
+
+    /// The ULID of the blob file on disk. If versioned, this will be the
+    /// current head. Has no meaning if zeroed.
+    pub blob_ulid: u128,
+
     // Variable length part:
-    // File: latest/head blob path
+    // Blobs: non-normalized file name
     // Symlink: destination path
 }
 
@@ -189,11 +208,12 @@ impl Default for FsRecordValue {
             access_time: TIME64_UNKNOWN_TIME,
             change_time: TIME64_UNKNOWN_TIME,
             delete_time: TIME64_UNKNOWN_TIME,
-            r#type: OBJ_TYPE_FILE,
+            r#type: OBJ_TYPE_NORMAL_BLOB,
             other1: 0,
             other2: 0,
             other3: 0,
             latest_version: 1,
+            blob_ulid: 0,
         }
     }
 }
@@ -236,11 +256,11 @@ pub struct VersionRecordValue {
 
 fn get_next_id (w: &WriteTransaction<'_>, table_name: &str) -> std::result::Result<FileSystemId, RedbError> {
     let mut seq_writer = w.open_table(SEQ_TABLE)?;
-    let last_id = seq_writer.get(FS_TABLE_NAME)?
+    let last_id = seq_writer.get(table_name)?
         .map(|s| s.value())
         .unwrap_or(0);
     let next_id = last_id + 1;
-    seq_writer.insert(FS_TABLE_NAME, next_id)?;
+    seq_writer.insert(table_name, next_id)?;
     Ok(last_id + 1)
 }
 
@@ -253,7 +273,8 @@ fn make_key (parent_id: FileSystemId, file_name: &str) -> Vec<u8> {
 
 fn is_readable_obj_type (obj_type: u8) -> bool {
     [
-        OBJ_TYPE_FILE,
+        OBJ_TYPE_NORMAL_BLOB,
+        OBJ_TYPE_VERSION_BLOB,
         OBJ_TYPE_APPEND_BLOB,
         OBJ_TYPE_BLOCK_BLOB,
         OBJ_TYPE_FIFO,
@@ -263,7 +284,8 @@ fn is_readable_obj_type (obj_type: u8) -> bool {
 
 // TODO: Handle symlinks
 // TODO: Use in upload and make_directory
-fn descend_path (path: &[String], fs: &ReadOnlyTable<'_, &[u8], &[u8]>)-> std::result::Result<FileSystemId, tonic::Status> {
+fn descend_path <'a, R> (path: &[String], fs: &'a R)-> std::result::Result<FileSystemId, tonic::Status>
+    where R: ReadableTable<&'static [u8], &'static [u8]> {
     let mut parent_id: FileSystemId = ROOT_FSID;
     for pc in path {
         let key = make_key(parent_id, pc);
@@ -292,6 +314,23 @@ fn descend_path (path: &[String], fs: &ReadOnlyTable<'_, &[u8], &[u8]>)-> std::r
     Ok(parent_id)
 }
 
+// fn get_real_path <'a, R> (file_rec: &FsRecordValue, file_rec_byte: &[u8], fs: &'a R) -> String
+//     where R: ReadableTable<&'static [u8], &'static [u8]> {
+//     match file_rec.r#type {
+//         OBJ_TYPE_NORMAL_BLOB
+//         | OBJ_TYPE_APPEND_BLOB
+//         | OBJ_TYPE_BLOCK_BLOB
+//         | OBJ_TYPE_FIFO
+//         | OBJ_TYPE_SOCKET => {
+//             // TODO: read trailing data
+//         },
+//         OBJ_TYPE_VERSION_BLOB => {
+//             // TODO: look up most recent version
+//         },
+//         OBJ_TYPE_SYMLINK => {},
+//     }
+// }
+
 // TODO: Use try equivalents to handle database corruption a little better.
 // TODO: Replace occurrences of this code with this function.
 fn fs_record_from_bytes (value: &[u8]) -> FsRecordValue {
@@ -311,6 +350,8 @@ pub struct DatabaseStorage {
     pub blobs_path: std::path::PathBuf,
     pub db_path: std::path::PathBuf,
     pub db: Database,
+    pub http_url_prefix: Option<String>,
+    pub tor_prefix: Option<String>,
 }
 
 impl DatabaseStorage {
@@ -336,6 +377,8 @@ impl DatabaseStorage {
             blobs_path,
             db_path,
             db,
+            http_url_prefix: None,
+            tor_prefix: None,
         }
     }
 }
@@ -471,7 +514,7 @@ impl Storage for DatabaseStorage {
                 .map_err(|_| tonic::Status::invalid_argument("invalid continuation token"))?
         };
 
-        let blob_file_name = format!("{}.blob", ulid);
+        let blob_file_name = format!("{}.blob", &ulid);
         let mut blob_path = self.blobs_path.clone();
         blob_path.push(blob_file_name);
         let mut f = OpenOptions::new()
@@ -565,13 +608,14 @@ impl Storage for DatabaseStorage {
             let current_version = latest_version.map(|v| v + 1).unwrap_or(1);
             let new_file_record = FsRecordValue {
                 id: file_id,
-                r#type: OBJ_TYPE_FILE, // FIXME: Allow creating different file types.
+                r#type: OBJ_TYPE_VERSION_BLOB, // FIXME: Allow creating different file types.
                 create_time: create_time.unwrap_or(Time64::now()),
                 modify_time: Time64::now(),
                 access_time: access_time.unwrap_or(Time64::now()),
                 change_time: TIME64_UNKNOWN_TIME,
                 delete_time: TIME64_UNKNOWN_TIME,
                 latest_version: current_version,
+                blob_ulid: ulid.0,
                 ..Default::default()
             };
             let new_value = [
@@ -870,7 +914,7 @@ impl Storage for DatabaseStorage {
         if target.version.as_ref().is_some_and(|v| v.major != file_rec.latest_version) {
             return Err(tonic::Status::invalid_argument("not deleting the latest version"));
         }
-        if file_rec.r#type != OBJ_TYPE_FILE {
+        if file_rec.r#type != OBJ_TYPE_VERSION_BLOB {
             // TODO: Check if the folder is empty. Recurse if requested.
             drop(file_rec_guard);
             drop(fs);
@@ -1030,20 +1074,164 @@ impl Storage for DatabaseStorage {
         }))
     }
 
+    // NOTE: This does not actually rename any file on disk.
     async fn r#move(
         &self,
         request: tonic::Request<MoveArg>,
     ) -> std::result::Result<tonic::Response<MoveResult>, tonic::Status> {
-        // https://docs.rs/tokio/latest/tokio/fs/fn.rename.html
-        unimplemented!()
+        let mut req = request.into_inner();
+        if req.target.is_none() {
+            return Err(tonic::Status::invalid_argument("target is required"));
+        }
+        let dest_file_name = match req.destination.pop() {
+            Some(f) => f,
+            None => return Err(tonic::Status::invalid_argument("destination is required")),
+        };
+        let target = req.target.as_ref().unwrap();
+        let mut fullpath = target.path.clone();
+        if fullpath.len() == 0 {
+            return Err(tonic::Status::invalid_argument("target may not be empty"));
+        }
+        let file_name = fullpath.pop().unwrap();
+        let dir_name = fullpath;
+        let w = self.db.begin_write()
+            .map_err(|_| tonic::Status::internal("could not read from database"))?;
+        {
+            let mut fs = w.open_table(FS_TABLE)
+                .map_err(|_| tonic::Status::internal("could not read from fs table"))?;
+            let src_parent_id = descend_path(&dir_name, &fs)?;
+            let dest_parent_id = descend_path(req.destination.as_slice(), &fs)?;
+            let src_file_key = make_key(src_parent_id, &file_name);
+            let dest_file_key = make_key(dest_parent_id, &dest_file_name);
+            let file_rec = {
+                let maybe_file_rec = fs.remove(&src_file_key.as_slice())
+                    .map_err(|_| tonic::Status::internal("could not read from fs table"))?;
+                if maybe_file_rec.is_none() {
+                    return Err(tonic::Status::invalid_argument("no such file"));
+                }
+                let file_rec_guard = maybe_file_rec.unwrap();
+                let file_rec_bytes = file_rec_guard.value();
+                fs_record_from_bytes(&file_rec_bytes)
+            };
+            if target.version.as_ref().is_some_and(|v| v.major != file_rec.latest_version) {
+                return Err(tonic::Status::invalid_argument("not moving the latest version"));
+            }
+            let new_file_rec_bytes = bytemuck::bytes_of(&file_rec);
+            let new_value = [
+                new_file_rec_bytes,
+                dest_file_name.as_bytes(),
+            ].concat();
+            let write_result = fs.insert(&dest_file_key.as_slice(), &new_value.as_slice())
+                .map_err(|_| tonic::Status::internal("could not write to fs table"))?;
+            if write_result.is_some() {
+                return Err(tonic::Status::invalid_argument("destination file already exists"));
+            }
+        }
+        w.commit()
+            .map_err(|_| tonic::Status::internal("could not commit changes"))?;
+        Ok(tonic::Response::new(MoveResult {
+            ..Default::default()
+        }))
     }
 
+    // TODO: Deduplicate this code with move(). It only differs by very few lines.
+    // TODO: CoW Flag / lazy-copy. (There may be a lot of pitfalls with this.)
+    // Currently, this uses the underlying FS to copy the file eagerly, which is not ideal.
     async fn copy(
         &self,
         request: tonic::Request<CopyArg>,
     ) -> std::result::Result<tonic::Response<CopyResult>, tonic::Status> {
         // https://docs.rs/tokio/latest/tokio/fs/fn.copy.html
-        unimplemented!()
+        let mut req = request.into_inner();
+        if req.target.is_none() {
+            return Err(tonic::Status::invalid_argument("target is required"));
+        }
+        let dest_file_name = match req.destination.pop() {
+            Some(f) => f,
+            None => return Err(tonic::Status::invalid_argument("destination is required")),
+        };
+        let target = req.target.as_ref().unwrap();
+        let mut fullpath = target.path.clone();
+        if fullpath.len() == 0 {
+            return Err(tonic::Status::invalid_argument("target may not be empty"));
+        }
+        let file_name = fullpath.pop().unwrap();
+        let dir_name = fullpath;
+        let w = self.db.begin_write()
+            .map_err(|_| tonic::Status::internal("could not read from database"))?;
+        {
+            let mut fs = w.open_table(FS_TABLE)
+                .map_err(|_| tonic::Status::internal("could not read from fs table"))?;
+            let src_parent_id = descend_path(&dir_name, &fs)?;
+            let dest_parent_id = descend_path(req.destination.as_slice(), &fs)?;
+            let src_file_key = make_key(src_parent_id, &file_name);
+            let dest_file_key = make_key(dest_parent_id, &dest_file_name);
+            let file_rec = {
+                let maybe_file_rec = fs.get(&src_file_key.as_slice()) // NOTE: This differs from move.
+                    .map_err(|_| tonic::Status::internal("could not read from fs table"))?;
+                if maybe_file_rec.is_none() {
+                    return Err(tonic::Status::invalid_argument("no such file"));
+                }
+                let file_rec_guard = maybe_file_rec.unwrap();
+                let file_rec_bytes = file_rec_guard.value();
+                fs_record_from_bytes(&file_rec_bytes)
+            };
+            // TODO: I think you only want to do this if the target is actually a versioned blob.
+            // Actually, I think I am getting rid of major and minor version numbers, right?
+            // if target.version.as_ref().is_some_and(|v| v.major != file_rec.latest_version) {
+            //     return Err(tonic::Status::invalid_argument("not moving the latest version"));
+            // }
+            let dest_ulid = Ulid::new();
+            match file_rec.r#type {
+                OBJ_TYPE_NORMAL_BLOB
+                | OBJ_TYPE_APPEND_BLOB
+                | OBJ_TYPE_BLOCK_BLOB => { // For these file types, clone the underlying blob.
+                    let src_blob_file_name = format!("{}.blob", &file_rec.blob_ulid);
+                    let mut src_blob_path = self.blobs_path.clone();
+                    src_blob_path.push(src_blob_file_name);
+                    let dest_blob_file_name = format!("{}.blob", &dest_ulid);
+                    let mut dest_blob_path = self.blobs_path.clone();
+                    dest_blob_path.push(dest_blob_file_name);
+                    copy(src_blob_path, dest_blob_path).await?;
+                },
+                OBJ_TYPE_SYMLINK => {}, // Nothing needs to be done for this type. Creating a new record is enough.
+                OBJ_TYPE_VERSION_BLOB => {
+                    // TODO:
+                },
+                // FIFO and socket are not allowed to be copied just because.
+                // Folder is not allowed to be copied at the moment because there
+                // are security implications I have to think through.
+                _ => return Err(tonic::Status::invalid_argument("not allowed to copy an object of this type")),
+            };
+
+            let create_time = Time64::now();
+            let new_rec = FsRecordValue {
+                id: get_next_id(&w, FS_TABLE_NAME)
+                    .map_err(|_| tonic::Status::internal("could not obtain new fs record id"))?,
+                blob_ulid: dest_ulid.0, // TODO: Should this be zeroed for a symlink?
+                create_time,
+                modify_time: create_time,
+                change_time: create_time,
+                ..Default::default()
+            };
+
+            let new_file_rec_bytes = bytemuck::bytes_of(&new_rec);
+            let new_value = [
+                new_file_rec_bytes,
+                dest_file_name.as_bytes(),
+            ].concat();
+            // TODO: On error, delete copied blob.
+            let write_result = fs.insert(&dest_file_key.as_slice(), &new_value.as_slice())
+                .map_err(|_| tonic::Status::internal("could not write to fs table"))?;
+            if write_result.is_some() {
+                return Err(tonic::Status::invalid_argument("destination file already exists"));
+            }
+        }
+        w.commit()
+            .map_err(|_| tonic::Status::internal("could not commit changes"))?;
+        Ok(tonic::Response::new(CopyResult {
+            ..Default::default()
+        }))
     }
 
     async fn list_incomplete_uploads(
@@ -1053,6 +1241,7 @@ impl Storage for DatabaseStorage {
         unimplemented!()
     }
 
+    // TODO: I have to determine what the syntax of the URL is.
     async fn get_presigned_download(
         &self,
         request: tonic::Request<GetPresignedDownloadArg>,
@@ -1060,6 +1249,7 @@ impl Storage for DatabaseStorage {
         unimplemented!()
     }
 
+    // TODO: I have to determine what the syntax of the URL is.
     async fn get_presigned_upload(
         &self,
         request: tonic::Request<GetPresignedUploadArg>,

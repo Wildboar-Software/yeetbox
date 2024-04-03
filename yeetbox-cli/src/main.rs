@@ -5,7 +5,9 @@ use remotefs::{
     DownloadArg,
     ListArg,
     AppendArg,
-    DeleteArg
+    DeleteArg,
+    MoveArg,
+    CopyArg,
 };
 
 pub mod remotefs {
@@ -89,20 +91,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // let t = std::str::from_utf8(response.get_ref().data.as_slice()).unwrap();
     // println!("{}", t);
 
-    let request4 = tonic::Request::new(ListArg {
-        target: Some(remotefs::RequestedFileId {
-            path: vec![
-                String::from("foo"),
-            ],
-            version: None,
-        }),
-        attrs: true,
-        ..Default::default()
-    });
-
-    let response = client.list(request4).await?;
-    println!("RESPONSE={:?}", response);
-
     let request5 = tonic::Request::new(AppendArg {
         target: Some(remotefs::RequestedFileId {
             path: vec![
@@ -118,7 +106,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let response = client.append(request5).await?;
     println!("RESPONSE={:?}", response);
 
-    let request6 = tonic::Request::new(DeleteArg {
+    // let request6 = tonic::Request::new(DeleteArg {
+    //     target: Some(remotefs::RequestedFileId {
+    //         path: vec![
+    //             String::from("foo"),
+    //             String::from("bar.txt"),
+    //         ],
+    //         version: None,
+    //     }),
+    //     ..Default::default()
+    // });
+
+    // let response = client.delete(request6).await?;
+    // println!("RESPONSE={:?}", response);
+
+    let request7 = tonic::Request::new(MoveArg {
         target: Some(remotefs::RequestedFileId {
             path: vec![
                 String::from("foo"),
@@ -126,10 +128,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ],
             version: None,
         }),
+        destination: vec![
+            String::from("foo"),
+            String::from("quux.txt"),
+        ],
         ..Default::default()
     });
 
-    let response = client.delete(request6).await?;
+    let response = client.r#move(request7).await?;
+    println!("RESPONSE={:?}", response);
+
+    let request8 = tonic::Request::new(CopyArg {
+        target: Some(remotefs::RequestedFileId {
+            path: vec![
+                String::from("foo"),
+                String::from("quux.txt"),
+            ],
+            version: None,
+        }),
+        destination: vec![
+            String::from("foo"),
+            String::from("quux2.txt"),
+        ],
+        ..Default::default()
+    });
+
+    let response = client.copy(request8).await?;
+    println!("RESPONSE={:?}", response);
+
+    let request4 = tonic::Request::new(ListArg {
+        target: Some(remotefs::RequestedFileId {
+            path: vec![
+                String::from("foo"),
+            ],
+            version: None,
+        }),
+        attrs: true,
+        ..Default::default()
+    });
+
+    let response = client.list(request4).await?;
     println!("RESPONSE={:?}", response);
 
     Ok(())

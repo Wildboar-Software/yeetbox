@@ -237,6 +237,7 @@ message FSAttributes {
     optional FileId source = 16; // For symbolic links only
     optional uint64 entries = 17; // For folders only
     uint32 storageTierId = 18;
+    map<string, google.protobuf.Any> otherMetadata = 19;
 }
 
 message Mechanism {
@@ -427,20 +428,20 @@ message ListResult {
 }
 
 message MoveArg {
-    FileId target = 1;
-    repeated bytes destination = 2;
+    RequestedFileId target = 1;
+    repeated string destination = 2;
     // If true and if a file already exists at the destination, make this the new version.
     bool next = 3;
 }
 
 message MoveResult {
     optional FileSystemError err = 1;
-    FileVersion version = 2;
+    FileVersion version = 2; // TODO: What is this for? Not currently
 }
 
 message CopyArg {
-    FileId target = 1;
-    repeated bytes destination = 2;
+    RequestedFileId target = 1;
+    repeated string destination = 2;
     // If true and if a file already exists at the destination, make this the new version.
     bool next = 3;
 }
@@ -451,7 +452,7 @@ message CopyResult {
 }
 
 message ListIncompleteUploadsArg {
-    repeated bytes subtree = 1; // Only everything that falls under this namespace.
+    repeated string subtree = 1; // Only everything that falls under this namespace.
     uint32 limit = 2;
     uint32 skip = 3;
 }
